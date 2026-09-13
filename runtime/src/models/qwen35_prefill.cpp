@@ -3473,6 +3473,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // Second join point for the GDN side branch: alpha/beta and wqkv_gate are consumed by two
     // different kernels, several launches apart.
     static thread_local cudaEvent_t ev_join_ab = nullptr;
+    // Fork/join for the FFN's gate|up pair. Its own pair of events, not the GDN block's: both
+    // live in the same layer and reusing one object would make the two overlaps' graph nodes
+    // depend on each other's record order for no reason.
+    static thread_local cudaEvent_t ev_fork_gu = nullptr;
+    static thread_local cudaEvent_t ev_join_gu = nullptr;
     // Width of the per-row MoE fan-out, counting the caller's stream. One row's MoE does not fill
     // the GPU, so issuing the rows on their own streams runs several at once. The rows are
     // independent (own input row, own expert slice, own scratch), so this changes only when the
@@ -3503,6 +3508,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "verify fork event");
         pf_cu(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "verify join event");
         pf_cu(cudaEventCreateWithFlags(&ev_join_ab, cudaEventDisableTiming), "verify ab join event");
+        pf_cu(cudaEventCreateWithFlags(&ev_fork_gu, cudaEventDisableTiming), "verify gu fork event");
+        pf_cu(cudaEventCreateWithFlags(&ev_join_gu, cudaEventDisableTiming), "verify gu join event");
     }
     if (!ph_ids) {
         // kVerifyMaxRows, not a literal. These were 16 when the widest block was 8 -- a margin
@@ -4455,13 +4462,38 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                   N >= kFfnGemmMinRows && w.gate_fp4 && w.gate_fp4_sf &&
                                   w.up_fp4 && w.up_fp4_sf && w.down_fp4 && w.down_fp4_sf;
             if (ffn_gemm) {
-                bool ok = kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, Ng, H, st) &&
-                          kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4,
-                                                             w.gate_fp4_sf, sg, Ng, ffn, H,
-                                                             fp4_ws, st, w.gate_fp4_alpha) &&
-                          kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.up_fp4,
-                                                             w.up_fp4_sf, su, Ng, ffn, H,
-                                                             fp4_ws, st, w.up_fp4_alpha);
+                // gate and up are two reads of the same quantized activation into two different
+                // outputs, with no dependence between them -- but issued back to back they run
+                // one after the other, and neither fills the machine: at these widths the
+                // block-scaled tile is one CTA tall, so each launches ceil(ffn/128) blocks, which
+                // on a 170-SM part is a single partial wave with the remainder idle. Put up on
+                // the side stream and the pair covers the machine instead of half of it.
+                //
+                // The quantize stays on the main stream ahead of the fork: both GEMMs read
+                // fp4_a/fp4_asf, so the write has to be ordered before the side stream starts.
+                // The join is placed at the SwiGLU, which is the first consumer of su.
+                // 0 keeps both on the main stream, so the pair can be A/B'd out of ONE binary.
+                static const bool gu_stream = [] {
+                    const char* e = getenv("SPARKINFER_DFLASH_GU_STREAM");
+                    return !(e && e[0] == '0');
+                }();
+                const bool fork_gu = gu_stream && fork_shared && ev_fork_gu;
+                cudaStream_t ust = fork_gu ? s.stream_k : st;
+                bool ok = kernels::launch_prefill_nvfp4_quant_a(hn, fp4_a, fp4_asf, Ng, H, st);
+                if (ok && fork_gu) {
+                    pf_cu(cudaEventRecord(ev_fork_gu, st), "verify gu fork");
+                    pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork_gu, 0), "verify gu fork wait");
+                }
+                ok = ok && kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.up_fp4,
+                                                              w.up_fp4_sf, su, Ng, ffn, H,
+                                                              fp4_ws, ust, w.up_fp4_alpha) &&
+                           kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_asf, w.gate_fp4,
+                                                              w.gate_fp4_sf, sg, Ng, ffn, H,
+                                                              fp4_ws, st, w.gate_fp4_alpha);
+                if (ok && fork_gu) {
+                    pf_cu(cudaEventRecord(ev_join_gu, s.stream_k), "verify gu join");
+                    pf_cu(cudaStreamWaitEvent(st, ev_join_gu, 0), "verify gu join wait");
+                }
                 if (ok) {
                     // Fold the down projection's activation quantize into the SwiGLU that
                     // produces it -- the prefill arm above already does this, and so does the
