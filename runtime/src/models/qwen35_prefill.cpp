@@ -4120,21 +4120,38 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                  w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
                  w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
                  w.ssm_beta_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
-            const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
-            cudaStream_t gst = fork_gdn ? s.stream_k : st;
-            if (fork_gdn) {
-                pf_cu(cudaEventRecord(ev_fork, st), "verify gdn fork");
-                pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify gdn fork wait");
-            }
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
             const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                      w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
                                      w.gdn_z_fp4 && w.gdn_z_fp4_sf;
-            if (gdn_in_gemm)
-                supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st) &&
+            // Issued BEFORE the fork deliberately. Both in-projections read fp4_a/fp4_asf, and
+            // the gate below now runs on the side stream, so a quantize issued after the fork
+            // event would be a write racing that stream's read -- the same rule the dp4a staging
+            // above already obeys.
+            // 0 restores main exactly -- gate back on the main stream AND the quantize back
+            // below the fork -- so both arms come out of ONE binary.
+            static const bool gdn_z_stream = [] {
+                const char* e = getenv("SPARKINFER_DFLASH_GDN_Z_STREAM");
+                return !(e && e[0] == '0');
+            }();
+            if (gdn_in_gemm && gdn_z_stream)
+                supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf, Ng, H, st);
+            const bool fork_gdn = fork_shared && q81_src == xn && q81_k == H;
+            cudaStream_t gst = fork_gdn ? s.stream_k : st;
+            cudaStream_t zst = (gdn_z_stream && fork_gdn) ? s.stream_k : st;
+            if (fork_gdn) {
+                pf_cu(cudaEventRecord(ev_fork, st), "verify gdn fork");
+                pf_cu(cudaStreamWaitEvent(s.stream_k, ev_fork, 0), "verify gdn fork wait");
+            }
+            if (gdn_in_gemm) {
+                if (!gdn_z_stream)   // main's position for the quantize
+                    supported = kernels::launch_prefill_nvfp4_quant_a(xn, fp4_a, fp4_asf,
+                                                                      Ng, H, st);
+                supported = supported &&
                             kernels::launch_prefill_nvfp4_gemm(
                                 fp4_a, fp4_asf, w.gdn_qkv_fp4, w.gdn_qkv_fp4_sf,
                                 rq, Ng, lqkv, H, fp4_ws, st, w.gdn_qkv_fp4_alpha);
+            }
             else
                 supported = proj(xn, w.wqkv, w.wqkv_type, rq, lqkv, H);
             // alpha and beta are v_heads-wide reads of the same xn — two launches whose cost is
@@ -4158,7 +4175,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         (gdn_in_gemm
                          ? kernels::launch_prefill_nvfp4_gemm(
                                fp4_a, fp4_asf, w.gdn_z_fp4, w.gdn_z_fp4_sf,
-                               lz, Ng, lvdim, H, fp4_ws, st, w.gdn_z_fp4_alpha)
+                               lz, Ng, lvdim, H, fp4_ws, zst, w.gdn_z_fp4_alpha)
                          : proj_on(gst, xn, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H)) &&
                         (ab_fused || (proj_on(gst, xn, w.ssm_alpha, w.ssm_alpha_type, ra, vh, H) &&
                                       proj_on(gst, xn, w.ssm_beta, w.ssm_beta_type, rb, vh, H)));
