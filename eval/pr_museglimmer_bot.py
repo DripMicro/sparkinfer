@@ -626,10 +626,18 @@ def _ssh_run_resilient(host, port, script: str, label: str):
     """One automatic retry on an apparent hard kill — same insurance pr_dflash_bot.py added
     after #684/#690 (heavy model-reload boundaries silently killing the whole remote shell)."""
     r = ssh_run(host, port, script, via_stdin=True)
-    if r.returncode != 0 and _looks_like_hard_kill(r.stdout, r.stderr):
-        print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no accuracy-stage "
-              f"checkpoint reached) — retrying once")
-        r = ssh_run(host, port, script, via_stdin=True)
+    if r.returncode != 0:
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        # An explicitly classified infrastructure fault must never be charged to the PR: the
+        # GPU not draining between stages says nothing about the change being measured.
+        if "RETRYABLE_INFRA_FAILURE" in combined:
+            print(f">> {label}: transient infrastructure failure — retrying the entire "
+                  "measurement once")
+            r = ssh_run(host, port, script, via_stdin=True)
+        elif _looks_like_hard_kill(r.stdout, r.stderr):
+            print(f">> {label}: looks like a hard kill (no ERR-trap diagnostic, no accuracy-stage "
+                  f"checkpoint reached) — retrying once")
+            r = ssh_run(host, port, script, via_stdin=True)
     return r
 
 
@@ -703,13 +711,21 @@ trap 'rc=$?; ln=$LINENO; reason=""; \\
 # pr_dflash_bot.py's wait_gpu_clear, #684/#690).
 wait_gpu_clear() {{
   local tries=0 used
-  while [ "$tries" -lt 30 ]; do
+  # 30s was not enough once the concurrent-decode axes landed (3b42b7a): the c=32 run holds
+  # ~26 GB across 33 sequences and does not always release inside half a minute, so the
+  # accuracy stage started anyway and OOM'd loading the model. That surfaced as
+  # REMOTE_SCRIPT_FAILED line=232 and was charged to the PR -- it skipped the whole round on
+  # the 20:00 main baseline and put eval:REJECT on #1059, whose own measurements were fine.
+  while [ "$tries" -lt 180 ]; do
     used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
     [ -n "$used" ] && [ "$used" -lt 1024 ] 2>/dev/null && return 0
     sleep 1
     tries=$((tries + 1))
   done
-  echo "WARN: GPU memory still ${{used:-unknown}} MiB after ${{tries}}s wait — proceeding anyway" >&2
+  # Do NOT proceed into a load that is now certain to OOM and get blamed on the PR. Name it
+  # as infrastructure so _ssh_run_resilient retries the measurement instead.
+  echo "RETRYABLE_INFRA_FAILURE GPU still holding ${{used:-unknown}} MiB after ${{tries}}s — refusing to start a load that would OOM" >&2
+  return 1
 }}
 
 export PATH=/usr/local/cuda-13.0/bin:/usr/local/cuda/bin:/usr/local/bin:$PATH
@@ -832,6 +848,10 @@ for CC in {cb_concs}; do
     tail -10 "$CB_OUT" >&2 || true
   fi
 done
+# The concurrency sweep is the heaviest stage in the run (five model loads, the last holding
+# ~26 GB across 33 sequences). Drain before the accuracy gate rather than letting that gate's
+# own wait absorb it, so a slow release is reported here instead of as an accuracy failure.
+wait_gpu_clear || exit 1
 
 # --- accuracy gate: sparkinfer teacher-forced score vs a live llama-server reference, same
 # GGUF, same eval_text.txt corpus this session already validated by hand (6d911d4) ---
