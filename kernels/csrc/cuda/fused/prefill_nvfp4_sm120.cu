@@ -183,6 +183,10 @@ using BigM = Cfg<Shape<_256, _128, _128>, true>;
 // the logit buffer rather than an activation, and logits are float: rounding them to bf16 would
 // put ties into argmax that the Q4_K head it replaces does not have.
 using WideF32 = Cfg<Shape<_128, _128, _256>, false, float>;
+// A 256-wide N tile for the packed continuous-batch widths. Same M as the pair above -- the
+// scale-factor atom pins that at 128 -- but each CTA carries twice the output columns and half
+// the K depth per stage. See prefer_n256 for when it is worth it.
+using WideN256 = Cfg<Shape<_128, _256, _128>>;
 // M is the axis that pays (256x128 beat 128x128 by 6.7% at m=16384 while 128x256 lost 14%), so
 // probe further up it. K stays >=128: at 64 the mainloop has too few elements per stage to cover
 // its own latency and the GEMM collapses (measured 2494 pp, a 4x loss).
@@ -591,6 +595,41 @@ bool prefer_narrow(int m, int n) {
     return on && m <= 128 && sms > 0 && 2 * ((n + 127) / 128) <= sms;
 }
 
+// The 128-wide tile's cost at these widths grows with its tile COUNT: one CTA per 128 output
+// columns, each holding only 16-32 valid rows of M, so the grid is wide and shallow and every CTA
+// is short. The 256-wide tile halves that count and doubles the work each CTA has to hide its own
+// TMA latency behind -- which is the axis that pays here, the same reason the identical GEMM is
+// measurably faster at 64 rows than at 16. Its cost is nearly FLAT in n (measured at m=16, k=5120,
+// DRAM-cold weights: 38.5 us at n=6144 through 39.6 us at n=13312), while the 128-wide tile scales
+// with n (21.0 -> 36.4 us over the same range). So the wide-N tile only pays once n is large
+// enough that the 128-wide grid has gone long:
+//
+//   n      CTAs@128   N=128    N=256          n      CTAs@128   N=128    N=256
+//   6144      48      20.96    38.54          15360     120     41.01    40.04
+//   10240     80      28.97    38.96          16384     128     43.13    40.67
+//   12288     96      34.16    39.35          17408     136     47.33    41.36
+//   13312    104      36.44    39.62          19456     152     50.80    44.32
+//   14336    112      40.44    39.64          24576     192     72.91    54.72
+//
+// The two cross at ~112 CTAs of 170, i.e. two thirds of the machine, which is the rule below.
+// It is expressed against the SM count rather than a literal n so it carries to another part.
+// Above this batch width the tile is not selected at all: from m=64 the M dimension is no longer
+// mostly padding and the tilings already tuned for prefill are the right ones.
+bool prefer_n256(int m, int n) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_N256_TILE");
+        return !e || atoi(e) != 0;
+    }();
+    static const int max_rows = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_N256_MAX_ROWS");
+        const int v = e ? atoi(e) : 32;
+        return v < 0 ? 0 : v;
+    }();
+    if (!on || m > max_rows) return false;
+    const int sms = sm_count();
+    return sms > 0 && 3 * ((n + 127) / 128) >= 2 * sms;
+}
+
 template <class C>
 bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
               void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha,
@@ -631,7 +670,10 @@ size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
         args<Wide>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
     const size_t nw = Narrow::Gemm::get_workspace_size(
         args<Narrow>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
-    return w > nw ? w : nw;
+    const size_t n2 = WideN256::Gemm::get_workspace_size(
+        args<WideN256>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    size_t r = w > nw ? w : nw;
+    return r > n2 ? r : n2;
 }
 bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
@@ -748,6 +790,8 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
         if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
 
     }
+    // Falls through to the tilings below if CUTLASS cannot implement the shape.
+    if (prefer_n256(m,n) && run_gemm<WideN256>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
     if (use_ef)
         return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
                                   : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
