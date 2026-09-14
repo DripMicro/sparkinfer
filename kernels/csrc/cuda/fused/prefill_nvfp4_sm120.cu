@@ -184,12 +184,23 @@ using BigM = Cfg<Shape<_256, _128, _128>, true>;
 // the logit buffer rather than an activation, and logits are float: rounding them to bf16 would
 // put ties into argmax that the Q4_K head it replaces does not have.
 using WideF32 = Cfg<Shape<_128, _128, _256>, false, float>;
+// Transposed twin of the above, for the LM head at packed-decode widths: narrow N (the row
+// count), column-major destination. See prefer_transposed.
+using NarrowTF32 = Cfg<Shape<_128, _16, _256>, false, float, cutlass::layout::ColumnMajor>;
 // A 256-wide N tile for the packed continuous-batch widths. Same M as the pair above -- the
 // scale-factor atom pins that at 128 -- but each CTA carries twice the output columns and half
 // the K depth per stage. See prefer_n256 for when it is worth it.
 using WideN256 = Cfg<Shape<_128, _256, _128>>;
-// Narrow N with a COLUMN-major destination: the transposed orientation below.
-using NarrowT = Cfg<Shape<_128, _64, _256>, false, BF, cutlass::layout::ColumnMajor>;
+// Narrow N with a COLUMN-major destination: the transposed orientation below. In that
+// orientation N carries the packed ROW COUNT, so the tile wants to be as close to it as the MMA
+// allows -- 16, not 64. Two things come from that: the N waste drops from 4x to none at sixteen
+// rows, and the B tile shrinks to a quarter, which carves a FOURTH mainloop stage out of the same
+// shared memory (NarrowT64 3, NarrowT 4). Measured DRAM-cold at 16 rows, us, 64-wide -> 16-wide:
+// out/wo 13.8 -> 11.1, down 37.8 -> 33.6, gdn_qkv 21.7 -> 20.3, gate/up 34.5 -> 32.8. At 32 rows
+// the 16-wide tile simply runs two N tiles, which doubles the grid and still wins.
+// SPARKINFER_NVFP4_TRANSPOSED_NTILE=64 restores the wider tile for an A/B out of one binary.
+using NarrowT = Cfg<Shape<_128, _16, _256>, false, BF, cutlass::layout::ColumnMajor>;
+using NarrowT64 = Cfg<Shape<_128, _64, _256>, false, BF, cutlass::layout::ColumnMajor>;
 // M is the axis that pays (256x128 beat 128x128 by 6.7% at m=16384 while 128x256 lost 14%), so
 // probe further up it. K stays >=128: at 64 the mainloop has too few elements per stage to cover
 // its own latency and the GEMM collapses (measured 2494 pp, a 4x loss).
@@ -722,8 +733,11 @@ size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
     const size_t n2 = WideN256::Gemm::get_workspace_size(
         args<WideN256>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
     // the transposed arm runs the same GEMM with m and n swapped
-    const size_t tw = NarrowT::Gemm::get_workspace_size(
+    size_t tw = NarrowT::Gemm::get_workspace_size(
         args<NarrowT>(nullptr,nullptr,nullptr,nullptr,nullptr,n,m,k));
+    const size_t tw64 = NarrowT64::Gemm::get_workspace_size(
+        args<NarrowT64>(nullptr,nullptr,nullptr,nullptr,nullptr,n,m,k));
+    if (tw64 > tw) tw = tw64;
     size_t r = w > nw ? w : nw;
     if (n2 > r) r = n2;
     return r > tw ? r : tw;
@@ -799,8 +813,12 @@ bool launch_prefill_nvfp4_quant_b_slice(const void* s, void* d, void* sf, int n,
     return cudaPeekAtLastError() == cudaSuccess;
 }
 size_t prefill_nvfp4_workspace_bytes_f32(int m, int n, int k) {
-    return WideF32::Gemm::get_workspace_size(
+    const size_t w = WideF32::Gemm::get_workspace_size(
         args<WideF32>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    // the transposed arm runs the same GEMM with m and n swapped
+    const size_t tw = NarrowTF32::Gemm::get_workspace_size(
+        args<NarrowTF32>(nullptr,nullptr,nullptr,nullptr,nullptr,n,m,k));
+    return w > tw ? w : tw;
 }
 // Float-destination twin of launch_prefill_nvfp4_gemm. One tiling only: its single caller is the
 // LM head, whose n is the vocabulary (1940 CTAs of the wide tile at 248320 columns), so the
@@ -810,6 +828,18 @@ bool launch_prefill_nvfp4_gemm_f32(const void* a,const void* sa,const void* b,co
                                    void* d,int m,int n,int k,void* ws,cudaStream_t st,
                                    float alpha) {
     if (!a||!sa||!b||!sb||!d||!prefill_nvfp4_supported(m,n,k)) return false;
+    // The head is the one GEMM whose N is the VOCABULARY, so its grid covers the machine many
+    // times over and the tile choices that matter elsewhere have nothing to pick between. Its M
+    // is still the packed row count, though, and at sixteen rows in a 128-row tile it computes
+    // 325 GFLOP to deliver 41 -- the transposed orientation removes exactly that, and the narrow
+    // N tile carves two extra mainloop stages on top. Same operand swap and same column-major
+    // destination as the bf16 path; the logits land at the addresses they already did.
+    static const bool head_t = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_TRANSPOSED_HEAD");
+        return !(e && e[0] == (char)48);
+    }();
+    if (head_t && prefer_transposed(m,n) &&
+        run_gemm<NarrowTF32>(b,sb,a,sa,d,n,m,k,ws,st,alpha,nullptr)) return true;
     return run_gemm<WideF32>(a,sa,b,sb,d,m,n,k,ws,st,alpha,nullptr);
 }
 bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const void* sb,
@@ -845,7 +875,15 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
     }
     // Falls through to the tilings below if CUTLASS cannot implement the shape.
     // Operands and extents swap: the weight becomes A/M, the activation becomes B/N.
-    if (prefer_transposed(m,n) && run_gemm<NarrowT>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)) return true;
+    if (prefer_transposed(m,n)) {
+        static const bool wide_ntile = [] {
+            const char* e = getenv("SPARKINFER_NVFP4_TRANSPOSED_NTILE");
+            return e && atoi(e) == 64;
+        }();
+        if (wide_ntile) {
+            if (run_gemm<NarrowT64>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)) return true;
+        } else if (run_gemm<NarrowT>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)) return true;
+    }
     if (prefer_n256(m,n) && run_gemm<WideN256>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
     if (use_ef)
         return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
