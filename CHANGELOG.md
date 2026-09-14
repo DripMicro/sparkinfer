@@ -3,6 +3,203 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.5.7] — 2026-09-14
+
+**Tool calls and structured output are grammar-constrained.** Every token of a tool-calling or
+`response_format` turn is sampled under a grammar that admits only output the server accepts, so a
+well-formed request no longer gets a 502 for an invalid call. The server also serves Qwen3.8 with
+DSpark speculative decoding, byte-identical to ordinary decode and decoding 2.5–3.5x faster on
+code, math, JSON and long-prompt requests in a deterministic-mode A/B. It reuses cached prompt
+prefixes, and it speaks the Anthropic Messages and OpenAI Responses APIs.
+
+### Tool calls
+
+On 0.5.6, valid tool-calling requests could return 502 in several ways. All are fixed (#1073).
+
+**Constrained decoding.** Every token of a tool-calling turn is sampled under an
+[xgrammar](https://github.com/mlc-ai/xgrammar) grammar that mirrors the server's own parser:
+
+- reasoning and content free of protocol markup;
+- calls only to offered functions: at least one for `"required"`, only the named one for a named
+  choice, and at most one with `parallel_tool_calls: false`;
+- every argument in the template's exact framing, with a value its schema allows: enums, consts,
+  numeric ranges, string lengths and patterns, nested objects and arrays, `$ref`, and
+  `anyOf`/`oneOf`/`allOf`.
+
+`response_format` is constrained the same way. `json_schema` output is exactly a value the schema
+accepts, and `json_object` output is always a JSON object.
+
+The grammar is compiled once per distinct tool set, and a token's mask is uploaded only when it
+changes. At equal output length, constrained decode costs under 1% (455 vs 458 tok/s on Qwen3.6).
+`SPARKINFER_TOOL_GRAMMAR=0` turns the grammar off. `/metrics` counts
+`sparkinfer_tool_calls_constrained_total` and `sparkinfer_structured_output_constrained_total`.
+
+**Also fixed:**
+
+- **`$ref` parameters** were resolved against the property instead of the tool's `parameters`
+  schema. Every call to a tool with a nested pydantic or zod model failed.
+- **`tool_choice: "required"` and named functions** were an instruction plus a check after
+  generation, so a model that answered in prose got a 502. Both are now enforced. With the grammar
+  off, the turn starts inside the call, and a missing call gets one retry from the model's reasoning
+  (`sparkinfer_tool_calls_forced_total`).
+- **`parallel_tool_calls: false`** failed a response that had more than one call. The first call is
+  now returned.
+
+**Measured.** 37 live checks through the `openai` SDK on Qwen3.8-27B NVFP4 pass 37/37: with the
+prefix cache on, with it off, and on a DSpark server. They cover:
+
+- streaming and non-streaming calls, and tool-result follow-ups;
+- every `tool_choice` mode, with thinking on and off, including prompts no offered tool fits;
+- nested `$ref`, `parallel_tool_calls: false`, `n=2`, stop sequences, and an image with a tool call;
+- a schema using every supported keyword, sampled 12 times;
+- `json_schema` and `json_object` output.
+
+**Limits.**
+
+- A turn that runs out of `max_tokens` mid-call returns an empty message with
+  `finish_reason: "length"`, since a partial call cannot be executed.
+  `SPARKINFER_LOG_TRUNCATED_OUTPUT=1` writes the generated tail to stderr.
+- Some schemas cannot be expressed exactly as a grammar: overlapping `oneOf` branches, a `pattern`
+  inside a JSON value, a non-integer or unbounded `multipleOf`, and a free-form object whose keys
+  could repeat. For those the server logs the approximation and still validates the arguments
+  afterwards, so such a call can still fail.
+- Argument text can contain `<`, except where it would start protocol markup (`<tool_call>`,
+  `</parameter>`, …). A string with `minLength` or `maxLength` cannot contain `<` at all. Numbers
+  have at most 18 integer digits and a two-digit exponent.
+- Qwen3.6-35B-A3B can reason in a loop until `max_tokens` when thinking is on, the choice is
+  `"required"` and no offered tool fits: 5 of 6 greedy runs did. It loops without the grammar too
+  (3 of 6, plus a 502). Qwen3.8 does not.
+
+### Correctness
+
+These affected 0.5.6.
+
+- **Temperature sampling emitted a random token on about 1.5% of steps.** The Gumbel noise
+  `-log(-log(u))` is +inf when the uniform draw is exactly 1.0. That happens about once in 2^24
+  draws, and a step draws once for each of the 248K vocabulary entries. The token with +inf noise
+  won whatever its logit, even under `logit_bias` −100. Greedy decoding was unaffected (#1073).
+- **Prompts past 32,768 tokens lost their Gated-DeltaNet state.** Windowed prefill runs in 16K
+  windows, and every window after the first restarted the Gated-DeltaNet layers (48 of them on
+  Qwen3.8-27B) from zero. Nothing caught it because the accuracy gates stop at 32K. The state now
+  carries into each window, and a pass at position 0 runs the same arithmetic as before (#1071).
+- **`logit_bias` did not apply to a response's first token**, which comes out of batched prefill.
+  It was also dropped whenever the request was decoded in a packed batch with another request.
+  Requests with `logit_bias` now stay out of packed batches (#1073).
+- **Graceful shutdown always waited the full 30 s grace period**, even when idle. Under Docker's
+  default 10 s stop timeout the container was SIGKILLed instead. The server now exits as soon as
+  in-flight requests drain: within 3 s idle, against 30.6 s before (#1079).
+
+### DSpark in the server
+
+`sparkinfer_server` serves Qwen3.8 with DSpark speculative decoding (#1076). The release container
+downloads the drafter and turns it on:
+
+```bash
+docker run --gpus all -p 8080:8080 -v qwen38:/models \
+  ghcr.io/gittensor-ai-lab/sparkinfer-qwen38:0.5.7 serve-dspark
+```
+
+From source, pass `--draft-model`. If a drafter is requested but missing or incompatible, the
+server stops at startup rather than silently serving without it.
+
+DSpark runs only for a greedy, plain-text request while it is the only active request. The
+following use ordinary decode:
+
+- sampling, penalties, `logit_bias` and logprobs;
+- images and video;
+- tool calls and `response_format`;
+- a request that reuses a cached prefix.
+
+When a second request arrives, the speculative one hands over at a committed token and continues
+in the batch.
+
+**Lossless, measured.** Qwen3.8-27B NVFP4 on an RTX 5090 with `SPARKINFER_DETERMINISTIC=1`, one
+request at a time, against the same server with no drafter. That reference was recorded twice and
+matched itself. Every output is byte-identical to it:
+
+| request | decode speed vs no drafter |
+|---|--:|
+| json | **3.45x** |
+| code | **2.86x** |
+| long (3,201-token prompt) | **2.54x** |
+| math | **2.45x** |
+| chat | **1.47x** |
+| 371-token prompt whose answer crosses 512 tokens | 1.01x |
+
+A request handed over mid-answer (2,588 characters) and an ordinary request sent after speculative
+ones were byte-identical too. These are deterministic-mode numbers; default-mode speed was not
+measured for this release.
+
+Two issues were fixed before release (#1078):
+
+- **Speculation stops at the next attention split tier** (the first is 512 tokens of context), and
+  ordinary decode finishes the request. That is why the last row gains nothing.
+  `sparkinfer_speculative_tier_stops_total` counts these stops, next to
+  `sparkinfer_speculative_runs_total`, `_tokens_total` and `_handoffs_total`.
+- **The drafter read a stale context between 384 and 1,024 tokens of context.** It happened after
+  every fully accepted block. Output stayed lossless, but acceptance suffered.
+
+### Automatic prefix cache
+
+Chat and agent clients resend the whole conversation on every turn. The server now reuses the part
+it already computed, and this is on by default (#1072). Measured on an RTX 5090, Qwen3.8-27B NVFP4,
+`--ctx 32768`, with an 11.5K-token system prompt:
+
+| | cache on | cache off |
+|---|--:|--:|
+| time to first token, turns 2–4 of one conversation | **249–313 ms** | 834–1,592 ms |
+| 12 concurrent conversations on that system prompt | **12/12 served** | 2/12 (10 × `429`) |
+
+**How it works.**
+
+- KV blocks are shared, not copied, so a conversation on a cached system prompt allocates blocks
+  only for its own suffix.
+- The recurrent state is snapshotted at up to two checkpoints per prompt into pinned host memory
+  (~205 MB each on Qwen3.8-27B).
+- A hit prefills only the remainder.
+
+Responses report `usage.prompt_tokens_details.cached_tokens`, and `/metrics` adds
+`sparkinfer_prefix_cache_*`.
+
+**Bounds.** At most 32 entries, 8 GiB of pinned host memory (`SPARKINFER_PREFIX_CACHE_HOST_MB`) and
+half the KV pool. The least-recently-used entry is evicted first, including when a new request
+cannot otherwise get KV blocks. Nothing is cached for `/v1/score`, for image or video requests, or
+under `SPARKINFER_DETERMINISTIC=1`. `SPARKINFER_PREFIX_CACHE=0` turns the cache off.
+
+A crash under concurrent load with the cache on was fixed before release (#1077). After the fix the
+server survived a 12-conversation stress test, then passed the tool suite. That run had 42 cache
+hits and reused 482,688 tokens.
+
+### Anthropic Messages and OpenAI Responses APIs
+
+| route | for |
+|---|---|
+| `POST /v1/messages` | Anthropic Messages API: Anthropic SDKs and clients that take an Anthropic base URL |
+| `POST /v1/messages/count_tokens` | Anthropic token counting, including `system` and `tools` |
+| `POST /v1/responses` | OpenAI Responses API, stateless |
+
+Both translate onto `/v1/chat/completions`, so they share its generation, constrained tool calls,
+schema validation, images, reasoning and sampling (#1070). Each streams in its own API's format:
+numbered content blocks for Anthropic, and sequence-numbered output items ending in
+`response.completed` for Responses. Errors come back in each API's own shape, on streams too.
+
+**Refused with 400** rather than quietly degraded:
+
+- Anthropic server tools (`web_search`, `bash`, …), `document` and `search_result` blocks, and images
+  inside `tool_result`;
+- Responses `previous_response_id`, `conversation`, `item_reference`, `background`, non-function
+  tools and file inputs.
+
+Nothing is stored: `GET` and `DELETE /v1/responses/{id}` return 404, so send the whole conversation
+in `input`. Anthropic `stop_reason` is `end_turn` for both end-of-sequence and a stop sequence.
+
+**Measured.** 14 of 14 live checks pass through the official `anthropic` 1.5.0 and `openai` 3.13.0
+SDKs, whose stream helpers rebuild the final message from the events. The checks cover plain
+replies, streams with thinking or reasoning, forced tool calls, tool-result follow-ups, token
+counting and error shapes. `/v1/chat/completions` and Ollama streams are unchanged.
+
+Not re-measured for this release: the vLLM and SGLang comparisons.
+
 ## [0.5.6] — 2026-09-14
 
 **SparkInfer decodes faster than vLLM at every concurrency from 2 to 32 streams** on Qwen3.8-27B
