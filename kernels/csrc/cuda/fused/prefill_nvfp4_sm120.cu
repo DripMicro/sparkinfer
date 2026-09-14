@@ -134,14 +134,15 @@ struct MmaEvictFirstB : Base {
     }
 };
 
-template <class TileShape, bool EvictFirstB = false, class ElemD = BF>
+template <class TileShape, bool EvictFirstB = false, class ElemD = BF,
+          class LayoutCD = cutlass::layout::RowMajor>
 struct Cfg {
     // Alignment is 128 bits / sizeof(element): 8 for bf16, 4 for float.
     static constexpr int kAlignD = 16 / (int)sizeof(ElemD);
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, Cluster,
         cutlass::epilogue::collective::EpilogueTileAuto, float, float,
-        ElemD, cutlass::layout::RowMajor, kAlignD, ElemD, cutlass::layout::RowMajor, kAlignD,
+        ElemD, LayoutCD, kAlignD, ElemD, LayoutCD, kAlignD,
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
     using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
@@ -187,6 +188,8 @@ using WideF32 = Cfg<Shape<_128, _128, _256>, false, float>;
 // scale-factor atom pins that at 128 -- but each CTA carries twice the output columns and half
 // the K depth per stage. See prefer_n256 for when it is worth it.
 using WideN256 = Cfg<Shape<_128, _256, _128>>;
+// Narrow N with a COLUMN-major destination: the transposed orientation below.
+using NarrowT = Cfg<Shape<_128, _64, _256>, false, BF, cutlass::layout::ColumnMajor>;
 // M is the axis that pays (256x128 beat 128x128 by 6.7% at m=16384 while 128x256 lost 14%), so
 // probe further up it. K stays >=128: at 64 the mainloop has too few elements per stage to cover
 // its own latency and the GEMM collapses (measured 2494 pp, a 4x loss).
@@ -521,10 +524,10 @@ template <class C = Wide>
 typename C::Gemm::Arguments args(const void* a, const void* sa, const void* b, const void* sb,
                                  void* d, int m, int n, int k, float alpha = 1.f,
                                  const void* c = nullptr) {
-    auto as = cutlass::make_cute_packed_stride(StrideA{}, {m,k,1});
-    auto bs = cutlass::make_cute_packed_stride(StrideB{}, {n,k,1});
-    auto cs = cutlass::make_cute_packed_stride(StrideC{}, {m,n,1});
-    auto ds = cutlass::make_cute_packed_stride(StrideD{}, {m,n,1});
+    auto as = cutlass::make_cute_packed_stride(typename C::Kernel::StrideA{}, {m,k,1});
+    auto bs = cutlass::make_cute_packed_stride(typename C::Kernel::StrideB{}, {n,k,1});
+    auto cs = cutlass::make_cute_packed_stride(typename C::Kernel::StrideC{}, {m,n,1});
+    auto ds = cutlass::make_cute_packed_stride(typename C::Kernel::StrideD{}, {m,n,1});
     // beta is 1 exactly when a source is supplied — the residual accumulate. With c == nullptr
     // beta MUST stay 0: the epilogue skips the C load entirely on beta == 0, and a non-zero beta
     // over a null pointer faults.
@@ -630,6 +633,52 @@ bool prefer_n256(int m, int n) {
     return sms > 0 && 3 * ((n + 127) / 128) >= 2 * sms;
 }
 
+// TRANSPOSED ORIENTATION for the packed continuous-batch widths.
+//
+// The NVFP4 scale-factor atom is 32x4 = 128 rows in M, so the M tile cannot go below 128 and a
+// 16-row packed step burns a 128-row tile to produce 16 rows -- most of the MMA thrown away, and
+// half of every mainloop stage's shared memory spent on A-operand padding, which is why the wide
+// tile gets only TWO stages and `down` sits at 47% of the DRAM roof.
+//
+// N has no such floor -- a 64-wide N tile is legal, it is the `Narrow` tiling above. So compute
+// the transpose instead: feed the WEIGHT as the M operand and the ACTIVATION as N.
+//
+//     D[m,n] = A[m,k] * B[n,k]^T   becomes   D'[n,m] = B[n,k] * A[m,k]^T
+//
+// M' = n is the full weight height, so nothing is padded there; N' = m rides a 64-wide tile, so
+// the waste drops from 8x to at most 4x and the B tile halves, which buys a third mainloop stage
+// (Wide 2, NarrowT 3) and with it the memory parallelism these 40-CTA launches lack.
+//
+// Three things make this a swap rather than a rewrite:
+//   * The scale-factor layouts coincide: prefill_nvfp4_scale_bytes_a(r,k) ==
+//     prefill_nvfp4_scale_bytes_b(r,k) at every shape here, and a weight quantized by quant_b
+//     feeds the A slot unchanged -- verified bit-identical. No operand is re-quantized.
+//   * Both operands are already K-contiguous (A RowMajor [m,k], B ColumnMajor [n,k]), so swapping
+//     which pointer goes where needs no repacking.
+//   * A COLUMN-major D of shape [n,m] is exactly a row-major [m,n] -- element (j,i) lands at
+//     i*n + j either way -- so the result appears at the same addresses as before and no caller
+//     changes. The same holds for the epilogue's C operand, so the residual fold-in still works.
+//
+// Measured DRAM-cold at 16 rows, us: gate/up 46.7 -> 34.4, down 53.7 -> 38.0, gdn_qkv 28.2 ->
+// 21.6, gdn_z 19.4 -> 15.2, out/wo 21.7 -> 16.1, q|gate 33.8 -> 25.4.
+//
+// Bounded at the widest batch a packed step can hand us. Above it the M dimension is no longer
+// mostly padding and the prefill-tuned tilings are the right ones -- the same bound prefer_narrow
+// and the evict-first rule already use. 0 disables, for an A/B out of one binary.
+bool prefer_transposed(int m, int n) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_TRANSPOSED");
+        return !e || atoi(e) != 0;
+    }();
+    static const int max_rows = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_TRANSPOSED_MAX_ROWS");
+        const int v = e ? atoi(e) : 32;
+        return v < 0 ? 0 : v;
+    }();
+    // n becomes the transposed M and inherits the A-operand's row rule.
+    return on && m > 0 && m <= max_rows && !(n & 7);
+}
+
 template <class C>
 bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
               void* d, int m, int n, int k, void* ws, cudaStream_t st, float alpha,
@@ -672,8 +721,12 @@ size_t prefill_nvfp4_workspace_bytes(int m, int n, int k) {
         args<Narrow>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
     const size_t n2 = WideN256::Gemm::get_workspace_size(
         args<WideN256>(nullptr,nullptr,nullptr,nullptr,nullptr,m,n,k));
+    // the transposed arm runs the same GEMM with m and n swapped
+    const size_t tw = NarrowT::Gemm::get_workspace_size(
+        args<NarrowT>(nullptr,nullptr,nullptr,nullptr,nullptr,n,m,k));
     size_t r = w > nw ? w : nw;
-    return r > n2 ? r : n2;
+    if (n2 > r) r = n2;
+    return r > tw ? r : tw;
 }
 bool launch_prefill_nvfp4_quant_a(const void* s, void* d, void* sf, int m, int k, cudaStream_t st) {
     if (!s || !d || !sf || !prefill_nvfp4_supported(m,128,k)) return false;
@@ -791,6 +844,8 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
 
     }
     // Falls through to the tilings below if CUTLASS cannot implement the shape.
+    // Operands and extents swap: the weight becomes A/M, the activation becomes B/N.
+    if (prefer_transposed(m,n) && run_gemm<NarrowT>(b,sb,a,sa,d,n,m,k,ws,st,alpha,c)) return true;
     if (prefer_n256(m,n) && run_gemm<WideN256>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
     if (use_ef)
         return prefer_narrow(m,n) ? run_gemm<NarrowEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
