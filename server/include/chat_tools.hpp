@@ -76,6 +76,11 @@ struct ChatRequest {
     std::string reasoning_effort;
     bool reasoning_exclude = false;
     ResponseFormat response_format;
+    // Server-internal, never read from a request body: raw template text the assistant turn starts
+    // with, after the generation prompt, so the model continues from it. The server uses it to force
+    // a tool call for tool_choice=required or a named function (forced_tool_call_prefix), and
+    // prepends the same text to the model's output before parsing it.
+    std::string assistant_prefix;
 };
 
 struct ParsedToolOutput {
@@ -83,7 +88,51 @@ struct ParsedToolOutput {
     std::string content;
     std::vector<ToolCall> tool_calls;
     std::string error;
+    // tool_choice=required or a named function, and the output has no call to an offered function:
+    // no call at all, only calls to other functions, or a call to a function that does not exist.
+    // The error is set, but reasoning_content is kept: the server continues from that reasoning
+    // into a forced call rather than failing the request.
+    bool missing_required_call = false;
 };
+
+// Grammar for constrained decoding of a tool-calling assistant turn: an xgrammar structural tag
+// (JSON) that admits only output parse_qwen36_tool_output accepts for the request -- reasoning and
+// content free of protocol markup, calls only to offered functions (only the named one for a named
+// tool_choice, at least one for required, at most one when parallel_tool_calls is false), each
+// parameter in the exact template framing with a value its schema allows.
+//
+// `exact` is false when some parameter constraint could only be approximated (a pattern that cannot
+// be rewritten to match the whole value, or a pattern combined with length bounds): the grammar then
+// admits a superset for that parameter, and the parser's validation remains the final word.
+struct ToolCallGrammar {
+    std::string structural_tag;
+    bool exact = true;
+    std::string approximation;   // why exact is false
+};
+// False (err set) for a request with no tool protocol to constrain: no tools, or tool_choice=none.
+bool build_tool_call_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
+                             std::string& err);
+
+// Grammar for response_format json_object / json_schema: optional reasoning, then one JSON value that
+// validate_response_format accepts for parse_plain_assistant_output's content. Same exactness
+// contract as ToolCallGrammar. False (err set) for a text response_format.
+bool build_response_format_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
+                                   std::string& err);
+
+// Reasoning and content of a Qwen turn without tools: with thinking on, reasoning up to the first
+// </think> and everything after it as content. parse_assistant_output's non-tool path; here so the
+// grammar that must agree with it can be tested without a tokenizer.
+struct PlainAssistantOutput {
+    std::string reasoning_content;
+    std::string content;
+};
+PlainAssistantOutput parse_plain_assistant_output(const std::string& raw, bool enable_thinking);
+
+// The opening of a native Qwen tool call that forces one: "<tool_call>\n<function=NAME>\n" for a
+// named function or for tool_choice=required with a single offered function, and
+// "<tool_call>\n<function=" for required with several (the model still writes the name, and can
+// write one that is not offered). Empty for any other tool_choice.
+std::string forced_tool_call_prefix(const ChatRequest& request);
 
 bool parse_chat_request_json(const std::string& body, ChatRequest& request, std::string& err);
 

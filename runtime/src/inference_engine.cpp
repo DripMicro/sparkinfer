@@ -51,6 +51,11 @@ double request_timeout_s_config() {
 }  // namespace
 
 struct ContinuousBatchEngine::Job {
+    // Constrained decoding: the mask last uploaded for this job and the dense bias built from it. A
+    // step whose mask is unchanged -- most of free text -- uploads nothing.
+    std::vector<uint32_t> mask_bits;
+    std::vector<uint32_t> mask_next;
+    std::vector<float> mask_bias;
     uint64_t request_id = 0;
     Request req;
     uint64_t seq_id = 0;
@@ -164,6 +169,39 @@ int ContinuousBatchEngine::num_active() const {
 
 int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blocks(); }
 
+bool ContinuousBatchEngine::apply_constraint_mask(Job& job) {
+    // Far below any real logit, finite so temperature scaling and logsumexp stay finite too.
+    static constexpr float kMasked = -1.0e9f;
+    const int vocab = model_->config().vocab;
+    const int words = (vocab + 31) / 32;
+    job.mask_next.assign(words, 0xffffffffu);
+    job.req.constraint->fill_next_mask(job.mask_next.data(), vocab);
+    if (vocab % 32) job.mask_next[words - 1] &= (1u << (vocab % 32)) - 1;
+    bool any = false;
+    for (uint32_t w : job.mask_next)
+        if (w) { any = true; break; }
+    if (!any) return false;
+    const bool first = job.mask_bias.empty();
+    if (!first && job.mask_next == job.mask_bits) return true;   // already on the device
+    if (first) {
+        job.mask_bias.assign(vocab, 0.f);
+        job.mask_bits.assign(words, 0u);
+    }
+    // Rebuild only the words that changed: the request's own logit_bias where allowed, kMasked where not.
+    std::vector<float> user(0);
+    for (int w = 0; w < words; ++w) {
+        if (!first && job.mask_next[w] == job.mask_bits[w]) continue;
+        const int end = std::min(vocab, (w + 1) * 32);
+        for (int id = w * 32; id < end; ++id)
+            job.mask_bias[id] = ((job.mask_next[w] >> (id - w * 32)) & 1) ? 0.f : kMasked;
+    }
+    for (const auto& [id, value] : job.req.logit_bias)
+        if (id >= 0 && id < vocab && ((job.mask_next[id / 32] >> (id % 32)) & 1)) job.mask_bias[id] = value;
+    job.mask_bits.swap(job.mask_next);
+    model_->set_logit_bias_dense(job.seq_id, job.mask_bias.data());
+    return true;
+}
+
 int ContinuousBatchEngine::max_queue_depth() const { return max_queue_depth_config(); }
 
 void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limits) {
@@ -267,6 +305,15 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
             }
             model_->reset_penalty_counts(seq_id);   // explicit, not relying on open_session's internal zero
             model_->set_logit_bias(seq_id, job.req.logit_bias);    // same reason
+        }
+        // The first token comes out of prefill, so its mask must be in place before prefill runs.
+        if (job.req.constraint) {
+            job.seq_id = seq_id;
+            if (!apply_constraint_mask(job)) {
+                if (seq_id != 0) model_->close_session(seq_id);   // session 0 is the shared prefix
+                else kv_->free(seq_id);
+                return fail(EnqueueError::BAD_REQUEST);
+            }
         }
     }
 
@@ -471,6 +518,9 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         if (j->req.temperature != 0.f) return false;
         if (j->req.top_k > 0 || j->req.top_p < 1.0f) return false;
         if (j->req.presence_penalty != 0.f || j->req.frequency_penalty != 0.f) return false;
+        // decode_packed applies no logit bias: a request with logit_bias or a constraint decodes on
+        // its own, where forward_token applies it.
+        if (!j->req.logit_bias.empty() || j->req.constraint) return false;
     }
 
     // Emit each row's pending token and run the same termination checks step_job() does. A job
@@ -786,6 +836,20 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         return true;
     }
 
+    // Constrained decoding: the token just emitted advances the constraint, and the next sample is
+    // drawn under the mask for what may follow it.
+    if (job.req.constraint) {
+        if (!job.req.constraint->accept(job.next_token)) {
+            job.error = "constrained decoding: emitted a token the constraint does not allow";
+            finish_job(job);
+            return true;
+        }
+        if (!apply_constraint_mask(job)) {
+            job.error = "constrained decoding: no token can continue the output";
+            finish_job(job);
+            return true;
+        }
+    }
     const int prompt_len = (int)job.req.prompt.size();
     const int sampled = model_->forward_token(job.next_token, prompt_len + job.decode_emitted - 1, true,
                                            job.req.temperature, job.req.seed,

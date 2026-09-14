@@ -262,16 +262,72 @@ matching `role: "tool"` results. Both streaming and non-streaming responses expo
 calls as `message.tool_calls` / `delta.tool_calls` with `finish_reason: "tool_calls"`; native XML
 control markup is validated against the offered schema and is never exposed to clients.
 
-Omitted `tool_choice`, `"auto"`, and `"none"` are supported. Forced/named choices and
-`parallel_tool_calls: false` return `400` until those constraints can be enforced by the runtime.
-Tool calls are currently Qwen3.6-only; Muse Glimmer uses a different tool protocol.
+`tool_choice` accepts omitted, `"auto"`, `"none"`, `"required"`, and OpenAI's named-function
+object form. `"required"` and a named function are enforced, not just requested. With thinking
+off, the assistant turn starts inside a tool call: `<tool_call>` plus `<function=NAME>` for a named
+function or a single offered one, and `<tool_call>` plus `<function=` for `"required"` over several.
+With thinking on, the model reasons first. If the attempt has no call to an offered function (the
+model answered in prose, or wrote a name that is not offered), the server generates once more from
+the model's reasoning with the call already opened on an offered function. For `"required"` over
+several, that function is the offered name the model itself ranks highest, chosen one token at a
+time with `logit_bias` restricted to the offered names. The retry spends what is left of
+`max_tokens` and adds its tokens to `completion_tokens`. Calls to functions other than a named one
+are dropped. With `parallel_tool_calls: false`, the first call is returned when the model emits
+several. `sparkinfer_tool_calls_forced_total{step="retry"|"pick_function"}` in `/metrics` counts
+how often that happened.
+Tool calls use the native Qwen XML protocol (Qwen3.6, Qwen3.8); Muse Glimmer uses a different
+tool protocol.
+
+Tool calls are **constrained**. Every token of a tool-calling turn is sampled under a grammar that
+only admits output the server's parser accepts:
+
+- reasoning and content free of protocol markup;
+- calls only to offered functions: at least one for `"required"`, only the named one for a named
+  choice, and at most one with `parallel_tool_calls: false`;
+- every argument in the template's exact framing, with a value its schema allows. That covers
+  enums, consts, numeric ranges, string lengths and patterns, nested objects and arrays, `$ref`,
+  and `anyOf`/`oneOf`/`allOf`.
+
+So a well-formed request cannot get an invalid tool call back. The one exception is running out of
+`max_tokens` mid-call, which returns `finish_reason: "length"`. The grammar is compiled once per
+distinct tool set, and each token's mask costs microseconds. `sparkinfer_tool_calls_constrained_total`
+counts constrained generations. `SPARKINFER_TOOL_GRAMMAR=0` turns the grammar off and falls back to the
+forced call opening and retry described above.
+
+The protocol puts a few limits on arguments:
+
+- Argument text, including strings inside JSON-typed arguments, can contain `<`, just never a `<`
+  that starts protocol markup (`<tool_call>`, `</parameter>`, `<think>`, `<|im_end|>`, …). That
+  markup would cut the call short for any Qwen tool parser.
+- A string argument with `minLength` or `maxLength` cannot contain `<`. Its characters are counted,
+  and the grammar cannot count them and exclude markup at the same time.
+- Numbers have at most 18 integer digits and a two-digit exponent, the range a double holds.
+
+Where the grammar cannot enforce a schema exactly, the server logs the approximation, and the
+argument is still validated after generation. This applies to:
+
+- `oneOf` branches that can overlap;
+- a `pattern` inside a JSON value;
+- a non-integer or unbounded `multipleOf`;
+- a free-form object (no `properties`, or `additionalProperties` allowed), where no grammar can stop
+  a key from repeating.
+
+`response_format` output is constrained the same way. `json_schema` output is exactly a value its
+schema accepts; with thinking on, the JSON cannot contain a `<think>` or `</think>` marker, which
+would split it. `json_object` output is always a JSON object. Keys can in principle repeat, so that
+case keeps the validation and single retry. `sparkinfer_structured_output_constrained_total` counts
+these generations.
+
 Muse requests containing tool definitions or tool-call history return `400`, including when
 `tool_choice` is `"none"`, so unsupported protocol data cannot be silently dropped.
 JSON Schema `pattern` uses the safe, linear-time RE2 syntax; unsupported expressions are rejected.
 Supported validation keywords are `type`, `properties`, `required`, `additionalProperties`,
-`items`, `enum`, numeric bounds, item/string length bounds, and `pattern`; unsupported validation
-keywords return `400` rather than being silently ignored. Annotation keywords `description`,
-`default`, and `title` are retained in the model prompt.
+`items`, `prefixItems`, `enum`, `const`, `anyOf`, `oneOf`, `allOf`, numeric bounds and
+`multipleOf`, item/string length bounds, `pattern`, and local `$ref` pointers into
+`$defs`/`definitions`, resolved against the tool's whole `parameters` schema. External
+references are refused. Unsupported validation keywords return `400` rather than being silently
+ignored. Annotation keywords `description`, `default`, and `title` are retained in the model
+prompt; `format`, `$schema`, `$comment`, and `x-*` vendor extensions are accepted as annotations.
 Qwen's native XML leaves string values unquoted. For a mixed string/non-string union, a value
 that is valid JSON is interpreted as its JSON type first (for example, `1` becomes an integer);
 avoid such unions when JSON-looking text must remain a string.

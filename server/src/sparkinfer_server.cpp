@@ -14,6 +14,7 @@
 
 // Do not define CPPHTTPLIB_OPENSSL_SUPPORT — even `= 0` enables OpenSSL in httplib.
 #include "../third_party/httplib.h"
+#include "tool_grammar.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -100,6 +102,9 @@ std::string g_api_key;
 // after load() for the architectures the engine can identify, unless --model-name was given.
 std::string g_model_name = "qwen3.6-35b-a3b";
 sparkinfer_server::ChatTokenizer g_tokenizer;
+// Constrained decoding of tool calls (see build_tool_call_grammar). Null when disabled
+// (SPARKINFER_TOOL_GRAMMAR=0) or for a model without the Qwen tool protocol.
+std::unique_ptr<sparkinfer_server::GrammarEngine> g_tool_grammar;
 const auto g_start_time = std::chrono::steady_clock::now();
 
 // Request/error metrics (GET /metrics). Counters only -- no per-request content is retained.
@@ -117,6 +122,17 @@ std::atomic<uint64_t> g_requests_server_error{0};   // 5xx
 // quality variance with a real infrastructure fault -- the exact conflation #779 already
 // documented once for overloaded (429) vs alloc_failed (503).
 std::atomic<uint64_t> g_requests_invalid_tool_output{0};
+// tool_choice=required or a named function where the model's own attempt had no call to an offered
+// function: a second generation forced one (retry), and for required over several functions the
+// function was first picked from the offered names (pick_function). Distinct from
+// invalid_tool_output -- these requests succeeded, and a rising rate means the model is resisting
+// the forced choice, not that calls are failing.
+// Generations decoded under a grammar (constrained decoding): tool-calling turns, and
+// response_format json_object/json_schema output.
+std::atomic<uint64_t> g_tool_constrained{0};
+std::atomic<uint64_t> g_format_constrained{0};
+std::atomic<uint64_t> g_tool_forced_retry{0};
+std::atomic<uint64_t> g_tool_forced_pick{0};
 // 502 -- same rationale as g_requests_invalid_tool_output above, for response_format: the model
 // produced output that failed JSON/schema validation on both the original and the corrective
 // retry attempt. Not a server_error -- this is a model-output-quality signal, not an infra fault.
@@ -632,6 +648,197 @@ sparkinfer_server::ChatRequest build_retry_request(const sparkinfer_server::Chat
     return retry;
 }
 
+// SPARKINFER_LOG_TRUNCATED_OUTPUT=1: log the tail of a tool-calling or structured-output generation that
+// ran out of max_tokens or hit a stop sequence. Such a turn returns an empty message -- a partial call or
+// partial JSON is not an executable result -- so without this there is no way to see what the model was
+// doing when the budget ran out.
+void log_truncated_output(const char* where, const std::string& text) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_LOG_TRUNCATED_OUTPUT");
+        return e && e[0] == '1';
+    }();
+    if (!on) return;
+    const size_t keep = 1200;
+    const std::string tail = text.size() > keep ? text.substr(text.size() - keep) : text;
+    fprintf(stderr, "[sparkinfer-server] truncated %s output (%zu bytes), tail:\n%s\n[end]\n", where, text.size(), tail.c_str());
+}
+
+// A fresh constraint for one generation -- constraints are stateful, so every branch and retry gets its
+// own. Null when the request is not constrained or its grammar fails to compile; the generation then
+// runs unconstrained, with the validation and retry fallbacks still in place.
+std::shared_ptr<sparkinfer::TokenConstraint> grammar_constraint(bool active,
+                                                                const sparkinfer_server::ToolCallGrammar& grammar,
+                                                                std::atomic<uint64_t>& counter) {
+    if (!active || !g_tool_grammar) return nullptr;
+    bool exact = grammar.exact;
+    std::string err;
+    auto constraint = g_tool_grammar->make_constraint(grammar.structural_tag, exact, err);
+    if (!constraint)
+        fprintf(stderr, "[sparkinfer-server] grammar failed to compile: %s\n", err.c_str());
+    else
+        counter++;
+    return constraint;
+}
+
+// tool_choice=required over several offered functions, and the model's attempt called none of them.
+// Picks the one the model itself ranks highest where a name starts: each step generates one token
+// with every token that can continue a still-possible name biased +100, so the pick is the model's
+// own argmax restricted to real names. A step only runs where the remaining names diverge, so
+// functions whose names differ in their first token cost one short prefill.
+bool pick_offered_function(sparkinfer_server::ModelEngine& engine,
+                           const sparkinfer_server::ChatRequest& request, bool enable_thinking,
+                           const std::string& turn_prefix,
+                           const sparkinfer_server::PreparedImages& images,
+                           const std::function<bool()>& alive, std::string& name,
+                           sparkinfer_server::CompletionResult& outcome, std::string& err) {
+    struct Candidate {
+        const std::string* name;
+        std::vector<int> ids;
+    };
+    std::vector<Candidate> left;
+    for (const auto& tool : request.tools) left.push_back({&tool.name, g_tokenizer.encode_raw(tool.name)});
+    sparkinfer_server::ChatRequest probe = request;
+    probe.assistant_prefix = turn_prefix + "<tool_call>\n<function=";
+    std::vector<int> ids = g_tokenizer.encode_augmented(probe, enable_thinking);
+    sparkinfer_server::PreparedImages imgs = images;
+    if (!imgs.images.empty() && !engine.reexpand_images(image_pad_token_id(), ids, imgs, err)) return false;
+    // Where one name ends and another continues, the ending one competes through the token that
+    // closes a name: ">" or, as the model usually writes it, ">\n".
+    std::vector<int> closers;
+    for (const char* close : {">", ">\n"}) {
+        const std::vector<int> t = g_tokenizer.encode_raw(close);
+        if (t.size() == 1) closers.push_back(t[0]);
+    }
+    auto add = [](std::vector<std::pair<int, float>>& bias, int token) {
+        for (const auto& b : bias)
+            if (b.first == token) return;
+        bias.push_back({token, 100.f});
+    };
+    for (size_t depth = 0; left.size() > 1; ++depth) {
+        std::vector<std::pair<int, float>> bias;
+        for (const Candidate& c : left) {
+            if (depth < c.ids.size()) add(bias, c.ids[depth]);
+            else for (int closer : closers) add(bias, closer);
+        }
+        int picked = bias.empty() ? -1 : bias[0].first;
+        if (bias.size() > 1) {
+            picked = -1;
+            outcome = engine.complete_streaming(ids, 1, [&](int tid) { picked = tid; return alive(); },
+                                                0.f, 0, 0, 1.0f, 0.f, 0.f, bias, false, 0, nullptr, {}, &imgs);
+            if (!outcome.error.empty()) {
+                err = outcome.error;
+                return false;
+            }
+            if (picked < 0) {
+                err = outcome.cancelled ? "cancelled" : "no token while choosing the function to call";
+                return false;
+            }
+        }
+        std::vector<Candidate> next;
+        for (Candidate& c : left) {
+            const bool keeps = depth < c.ids.size()
+                ? c.ids[depth] == picked
+                : std::find(closers.begin(), closers.end(), picked) != closers.end();
+            if (keeps) next.push_back(std::move(c));
+        }
+        if (next.empty()) break;   // the bias did not hold; fall back to the first remaining name
+        left = std::move(next);
+        ids.push_back(picked);
+    }
+    name = *left[0].name;
+    return true;
+}
+
+// Sampling controls for force_tool_call, so the forced attempt samples exactly as the attempt it
+// follows did.
+struct ForcedCallSampling {
+    float temperature = 0.f;
+    uint64_t seed = 0;
+    int top_k = 0;
+    float top_p = 1.0f;
+    float presence_penalty = 0.f;
+    float frequency_penalty = 0.f;
+    std::vector<std::pair<int, float>> logit_bias;
+};
+
+// tool_choice=required or a named function, and the model's attempt has no call to an offered
+// function (ParsedAssistantOutput::missing_required_call): it answered in prose after reasoning, or
+// wrote a name that is not offered. Generate once more with the assistant turn rebuilt as that
+// reasoning, the closed think block and a tool call already opened on an offered function -- the
+// named one, the only one, or pick_offered_function's choice -- so the model is left to write the
+// arguments. `raw` receives the whole assistant text including that opening, ready for
+// parse_assistant_output.
+//
+// max_tokens is what the first attempt left of the request's budget; its reasoning becomes prompt,
+// so prompt + max_tokens stays within the reservation the request was admitted with. Generated
+// tokens are added to completion_tokens; prompt usage stays the client's prompt. False on an engine
+// failure (outcome says which) or a cancel (outcome.cancelled).
+bool force_tool_call(sparkinfer_server::ModelEngine& engine,
+                     const sparkinfer_server::ChatRequest& request, bool enable_thinking,
+                     const std::string& reasoning, int max_tokens, const ForcedCallSampling& s,
+                     const sparkinfer_server::PreparedImages& images,
+                     const std::vector<std::string>& stop,
+                     const std::function<bool()>& alive,
+                     std::string& raw, bool& stopped_by_sequence,
+                     sparkinfer_server::CompletionResult& outcome,
+                     long long& completion_tokens, std::string& err) {
+    const std::string turn = enable_thinking ? reasoning + "\n</think>\n\n" : std::string();
+    std::string name;
+    if (request.tool_choice == sparkinfer_server::ToolChoiceMode::kNamed) {
+        name = request.required_tool_name;
+    } else if (request.tools.size() == 1) {
+        name = request.tools[0].name;
+    } else {
+        g_tool_forced_pick++;
+        if (!pick_offered_function(engine, request, enable_thinking, turn, images, alive, name, outcome, err))
+            return false;
+    }
+    g_tool_forced_retry++;
+    sparkinfer_server::ChatRequest forced = request;
+    forced.assistant_prefix = turn + "<tool_call>\n<function=" + name + ">\n";
+    std::vector<int> ids = g_tokenizer.encode_augmented(forced, enable_thinking);
+    sparkinfer_server::PreparedImages imgs = images;
+    // The rebuilt prompt carries bare image placeholders again, at new offsets.
+    if (!imgs.images.empty() && !engine.reexpand_images(image_pad_token_id(), ids, imgs, err))
+        return false;
+    std::vector<int> gen;
+    std::string stop_text;
+    stopped_by_sequence = false;
+    auto on_tok = [&](int tid) -> bool {
+        if (stop.empty()) {
+            gen.push_back(tid);
+            return alive();
+        }
+        stop_text += g_tokenizer.decode_delta(gen, tid);
+        size_t pos;
+        if (find_stop_match(stop_text, stop, pos)) {
+            stopped_by_sequence = true;
+            return false;
+        }
+        return alive();
+    };
+    outcome = engine.complete_streaming(ids, max_tokens, on_tok, s.temperature, s.seed, s.top_k, s.top_p,
+                                        s.presence_penalty, s.frequency_penalty, s.logit_bias,
+                                        false, 0, nullptr, {}, &imgs);
+    completion_tokens += (long long)gen.size();
+    if (!outcome.error.empty()) {
+        err = outcome.error;
+        return false;
+    }
+    if (outcome.cancelled && !stopped_by_sequence) {
+        err = "cancelled";
+        return false;
+    }
+    std::string text;
+    if (!decode_ids(gen, text, err)) return false;
+    if (stopped_by_sequence) {
+        size_t pos;
+        if (find_stop_match(text, stop, pos)) text.resize(pos);
+    }
+    raw = forced.assistant_prefix + text;
+    return true;
+}
+
 std::vector<int> load_prefix_token_ids() {
     std::vector<int> out;
     if (const char* csv = getenv("SPARKINFER_SERVER_PREFIX_TOKEN_IDS")) {
@@ -729,6 +936,24 @@ int main(int argc, char** argv) {
     {
         const std::vector<int> ims = g_tokenizer.encode_raw("<|im_start|>");
         if (ims.size() == 1) engine.set_prefix_cache_boundary_token(ims[0]);
+    }
+
+    // The tool-call grammar needs the exact bytes of every token id. Built once: a few seconds for a
+    // 248K vocabulary. Muse Glimmer has no Qwen tool protocol (tools are refused there), so none.
+    if (!engine.is_museglimmer() && env_string("SPARKINFER_TOOL_GRAMMAR") != "0") {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int vocab = engine.vocab();
+        std::vector<std::string> pieces(vocab);
+        std::vector<int> stops;
+        for (int id = 0; id < vocab; ++id) {
+            const sparkinfer_server::RawTokenPiece piece = g_tokenizer.id_to_raw_piece(id);
+            pieces[id].assign(piece.bytes.begin(), piece.bytes.end());
+            if (engine.is_stop_token(id)) stops.push_back(id);
+        }
+        g_tool_grammar = std::make_unique<sparkinfer_server::GrammarEngine>(pieces, vocab, stops);
+        fprintf(stderr, "[sparkinfer-server] tool calls: constrained decoding on (%d tokens, %zu stop ids, %.1f s)\n",
+                vocab, stops.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 
     const std::vector<int> prefix_ids = load_prefix_token_ids();
@@ -910,6 +1135,16 @@ int main(int argc, char** argv) {
              << g_requests_invalid_tool_output.load() << "\n"
              << "sparkinfer_requests_by_outcome_total{outcome=\"invalid_json_output\"} "
              << g_requests_invalid_json_output.load() << "\n"
+                "# HELP sparkinfer_tool_calls_constrained_total Tool-calling generations decoded under the tool-call grammar\n"
+                "# TYPE sparkinfer_tool_calls_constrained_total counter\n"
+             << "sparkinfer_tool_calls_constrained_total " << g_tool_constrained.load() << "\n"
+                "# HELP sparkinfer_structured_output_constrained_total response_format JSON generations decoded under a grammar\n"
+                "# TYPE sparkinfer_structured_output_constrained_total counter\n"
+             << "sparkinfer_structured_output_constrained_total " << g_format_constrained.load() << "\n"
+                "# HELP sparkinfer_tool_calls_forced_total Required/named tool calls the server forced after the model's attempt\n"
+                "# TYPE sparkinfer_tool_calls_forced_total counter\n"
+             << "sparkinfer_tool_calls_forced_total{step=\"retry\"} " << g_tool_forced_retry.load() << "\n"
+             << "sparkinfer_tool_calls_forced_total{step=\"pick_function\"} " << g_tool_forced_pick.load() << "\n"
                 "# HELP sparkinfer_tokens_total Tokens processed\n"
                 "# TYPE sparkinfer_tokens_total counter\n"
              << "sparkinfer_tokens_total{kind=\"prompt\"} " << g_prompt_tokens_total.load() << "\n"
@@ -1242,6 +1477,50 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
+                 // Constrained decoding: every token of a tool-calling turn is sampled under a grammar
+                 // that admits only output the parser accepts -- calls to offered functions, at least
+                 // one for required, only the named one for a named choice, arguments valid for their
+                 // schemas. Built once per request; each generation gets its own constraint.
+                 sparkinfer_server::ToolCallGrammar tool_grammar;
+                 bool constrained_tools = false;
+                 if (g_tool_grammar && !chat_request.tools.empty() &&
+                     chat_request.tool_choice != sparkinfer_server::ToolChoiceMode::kNone) {
+                     std::string gerr;
+                     constrained_tools = sparkinfer_server::build_tool_call_grammar(chat_request, enable_thinking,
+                                                                                    tool_grammar, gerr);
+                     if (!constrained_tools)
+                         fprintf(stderr, "[sparkinfer-server] tool calls unconstrained for this request: %s\n", gerr.c_str());
+                     else if (!tool_grammar.exact)
+                         fprintf(stderr, "[sparkinfer-server] tool-call grammar approximates: %s\n",
+                                 tool_grammar.approximation.c_str());
+                 }
+                 // response_format json_object/json_schema under a grammar too: the output is the JSON
+                 // value validate_response_format accepts, not a hope checked afterwards.
+                 sparkinfer_server::ToolCallGrammar format_grammar;
+                 bool constrained_format = false;
+                 if (g_tool_grammar &&
+                     chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText) {
+                     std::string gerr;
+                     constrained_format = sparkinfer_server::build_response_format_grammar(
+                         chat_request, enable_thinking, format_grammar, gerr);
+                     if (!constrained_format)
+                         fprintf(stderr, "[sparkinfer-server] structured output unconstrained for this request: %s\n", gerr.c_str());
+                     else if (!format_grammar.exact)
+                         fprintf(stderr, "[sparkinfer-server] structured-output grammar approximates: %s\n",
+                                 format_grammar.approximation.c_str());
+                 }
+                 // Fallback when the grammar is unavailable. tool_choice=required or a named function
+                 // is a contract: the caller branches on tool_calls. Instructing the model is not
+                 // enforcing it, so with thinking off the assistant turn starts inside the call and the
+                 // model can only complete one. (With thinking on the model reasons first, and a call
+                 // that does not come is forced afterwards -- see force_tool_call, which also covers an
+                 // invented function name.) Before images are prepared, so their placeholders expand
+                 // in the prompt that is actually sent.
+                 if (!constrained_tools && !enable_thinking && !engine.is_museglimmer() &&
+                     !sparkinfer_server::forced_tool_call_prefix(chat_request).empty()) {
+                     chat_request.assistant_prefix = sparkinfer_server::forced_tool_call_prefix(chat_request);
+                     prompt_ids = g_tokenizer.encode_augmented(chat_request, enable_thinking);
+                 }
                  // Images: decode, preprocess, and expand each placeholder to the token count
                  // its grid needs. Deliberately BEFORE the max_seq check below -- a 1024x1536
                  // image expands one placeholder into 1536 tokens, so checking the unexpanded
@@ -1337,6 +1616,7 @@ int main(int argc, char** argv) {
                           // shares its pixel buffers rather than owning them.
                           prepared,
                           chat_request, tool_protocol, json_mode_active,
+                          tool_grammar, constrained_tools, format_grammar, constrained_format,
                           dialect = stream_dialect_of(req),
                           stream_context = req.get_header_value(kStreamContextHeader),
                           ollama_generate =
@@ -1471,7 +1751,8 @@ int main(int argc, char** argv) {
                                      outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
                                          temperature, branch_seed, top_k, top_p, presence_penalty,
                                          frequency_penalty, logit_bias, false, 0, nullptr, {},
-                                         &cur_images);
+                                         &cur_images,
+                                         grammar_constraint(constrained_format, format_grammar, g_format_constrained));
                                      out->prompt_tokens += (long long)cur_prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                      out->completion_tokens += (long long)ids.size();
                                      if (outcome.cancelled && !stopped_by_sequence) {
@@ -1501,6 +1782,7 @@ int main(int argc, char** argv) {
                                          text, enable_thinking, engine.is_museglimmer(), nullptr);
                                      const bool truncated = outcome.reached_token_limit || stopped_by_sequence;
                                      if (truncated) {
+                                         log_truncated_output("structured-output", text);
                                          validation_err = outcome.reached_token_limit
                                              ? "truncated: hit max_tokens before producing valid output"
                                              : "truncated: hit a stop sequence before producing valid output";
@@ -1625,7 +1907,7 @@ int main(int argc, char** argv) {
                                  const auto outcome = engine.complete_streaming(prompt_ids, max_tokens, on_tok,
                                      temperature, branch_seed, top_k, top_p, presence_penalty, frequency_penalty,
                                      logit_bias, logprobs, top_logprobs, maybe_on_tok_logprob,
-                                     {}, &prepared);
+                                     {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
                                  out->prompt_tokens = (long long)prompt_ids.size(); out->cached_tokens = outcome.cached_tokens;
                                  out->completion_tokens = (long long)stream_ids.size();
                                  if (outcome.cancelled && !stopped_by_sequence) {
@@ -1655,9 +1937,38 @@ int main(int argc, char** argv) {
                                          if (find_stop_match(text, stop, pos)) text.resize(pos);
                                      }
                                      out->parsed = sparkinfer_server::parse_assistant_output(
-                                         text, enable_thinking, engine.is_museglimmer(), &chat_request);
+                                         chat_request.assistant_prefix + text, enable_thinking,
+                                         engine.is_museglimmer(), &chat_request);
+                                     bool truncated = outcome.reached_token_limit || stopped_by_sequence;
+                                     if (out->parsed.missing_required_call && !truncated) {
+                                         std::string raw, ferr;
+                                         bool forced_stopped = false;
+                                         sparkinfer_server::CompletionResult forced;
+                                         const ForcedCallSampling fs{temperature, branch_seed, top_k, top_p,
+                                                                     presence_penalty, frequency_penalty, logit_bias};
+                                         if (!force_tool_call(engine, chat_request, enable_thinking,
+                                                              out->parsed.reasoning_content,
+                                                              std::max(1, max_tokens - (int)stream_ids.size()),
+                                                              fs, prepared, stop,
+                                                              [&] { return sink.is_writable(); },
+                                                              raw, forced_stopped, forced,
+                                                              out->completion_tokens, ferr)) {
+                                             out->fail = forced.cancelled ? BranchOutcome::Fail::cancelled
+                                                       : forced.overloaded ? BranchOutcome::Fail::overloaded
+                                                       : forced.alloc_failed ? BranchOutcome::Fail::alloc_failed
+                                                       : forced.timed_out ? BranchOutcome::Fail::timeout
+                                                                          : BranchOutcome::Fail::server_error;
+                                             out->fail_message = ferr;
+                                             return;
+                                         }
+                                         out->parsed = sparkinfer_server::parse_assistant_output(
+                                             raw, enable_thinking, engine.is_museglimmer(), &chat_request);
+                                         truncated = forced.reached_token_limit || forced_stopped;
+                                         out->finish_reason = forced.reached_token_limit ? "length" : "stop";
+                                     }
                                      if (!out->parsed.error.empty()) {
-                                         if (outcome.reached_token_limit || stopped_by_sequence) {
+                                         if (truncated) {
+                                             log_truncated_output("tool-call (stream)", text);
                                              // A truncated native call is not an executable result,
                                              // but token exhaustion (or a stop sequence landing mid
                                              // tool-call XML) is still a normal completion.
@@ -1922,7 +2233,8 @@ int main(int argc, char** argv) {
                              outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
                                  controls.temperature, branch_seed, controls.top_k, controls.top_p,
                                  controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
-                                 false, 0, nullptr, {}, &cur_images);
+                                 false, 0, nullptr, {}, &cur_images,
+                                 grammar_constraint(constrained_format, format_grammar, g_format_constrained));
                              out.prompt_tokens += (long long)cur_prompt_ids.size(); out.cached_tokens = outcome.cached_tokens;
                              out.completion_tokens += (long long)ids.size();
                              if (!outcome.error.empty()) {
@@ -1955,6 +2267,7 @@ int main(int argc, char** argv) {
                              // it's a normal validation failure subject to the same retry policy.
                              const bool truncated = outcome.reached_token_limit || stopped_by_sequence;
                              if (truncated) {
+                                 log_truncated_output("structured-output", text);
                                  validation_err = outcome.reached_token_limit
                                      ? "truncated: hit max_tokens before producing valid output"
                                      : "truncated: hit a stop sequence before producing valid output";
@@ -2025,7 +2338,7 @@ int main(int argc, char** argv) {
                              controls.temperature, branch_seed, controls.top_k, controls.top_p,
                              controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                              controls.logprobs, controls.top_logprobs, maybe_nonstream_on_tok_logprob,
-                             {}, &prepared);
+                             {}, &prepared, grammar_constraint(tool_protocol && constrained_tools, tool_grammar, g_tool_constrained));
                          // Defensive clamp -- should already hold, cheap insurance against any
                          // subtle off-by-one between the two accumulation paths above.
                          if (logprob_entries.size() > outcome.tokens.size())
@@ -2055,10 +2368,40 @@ int main(int argc, char** argv) {
                          }
 
                          parsed = sparkinfer_server::parse_assistant_output(
-                             text, enable_thinking, engine.is_museglimmer(),
+                             (tool_protocol ? chat_request.assistant_prefix : std::string()) + text,
+                             enable_thinking, engine.is_museglimmer(),
                              tool_protocol ? &chat_request : nullptr);
+                         bool truncated = outcome.reached_token_limit || stopped_by_sequence;
+                         bool length_hit = outcome.reached_token_limit;
+                         if (tool_protocol && parsed.missing_required_call && !truncated) {
+                             std::string raw, ferr;
+                             bool forced_stopped = false;
+                             sparkinfer_server::CompletionResult forced;
+                             const ForcedCallSampling fs{controls.temperature, branch_seed, controls.top_k,
+                                                         controls.top_p, controls.presence_penalty,
+                                                         controls.frequency_penalty, controls.logit_bias};
+                             if (!force_tool_call(engine, chat_request, enable_thinking, parsed.reasoning_content,
+                                                  std::max(1, max_tokens - (int)outcome.tokens.size()),
+                                                  fs, prepared, controls.stop,
+                                                  [] { return true; }, raw, forced_stopped, forced,
+                                                  out.completion_tokens, ferr)) {
+                                 out.http_status = forced.cancelled ? 499
+                                                 : forced.error.empty() ? 500 : status_for_outcome(forced);
+                                 out.fail = forced.overloaded ? NonStreamBranchOutcome::Fail::overloaded
+                                          : forced.alloc_failed ? NonStreamBranchOutcome::Fail::alloc_failed
+                                          : forced.timed_out ? NonStreamBranchOutcome::Fail::timeout
+                                                              : NonStreamBranchOutcome::Fail::server_error;
+                                 out.http_error = ferr;
+                                 return out;
+                             }
+                             parsed = sparkinfer_server::parse_assistant_output(
+                                 raw, enable_thinking, engine.is_museglimmer(), &chat_request);
+                             truncated = forced.reached_token_limit || forced_stopped;
+                             length_hit = forced.reached_token_limit;
+                         }
                          if (!parsed.error.empty()) {
-                             if (outcome.reached_token_limit || stopped_by_sequence) {
+                             if (truncated) {
+                                 log_truncated_output("tool-call", text);
                                  // Never expose a truncated native tag sequence. A length/stop end
                                  // is a valid completion, so return an empty assistant result
                                  // instead of a hard failure.
@@ -2070,7 +2413,7 @@ int main(int argc, char** argv) {
                                  return out;
                              }
                          }
-                         finish_reason = outcome.reached_token_limit ? "length" : "stop";
+                         finish_reason = length_hit ? "length" : "stop";
                      }
 
                      nlohmann::json message = {{"role", "assistant"}};
