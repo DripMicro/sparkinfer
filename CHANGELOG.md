@@ -3,6 +3,132 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.5.6] — 2026-09-14
+
+**SparkInfer decodes faster than vLLM at every concurrency from 2 to 32 streams** on Qwen3.8-27B
+NVFP4 — 1.34x at 2, 1.14x at 16, 1.07x at 32 — and the server now speaks the LM Studio and Ollama
+APIs alongside OpenAI's.
+
+### Concurrent decode versus vLLM
+
+Same box, same checkpoint, same workload. Three reps per point, median reported.
+
+| concurrent streams | SparkInfer | vLLM 0.29.0 | SparkInfer vs vLLM |
+|---:|---:|---:|---:|
+| 2 | **187.6 tok/s** | 139.7 | **+34.3%** |
+| 4 | **327.5** | 271.0 | **+20.8%** |
+| 8 | **623.4** | 530.9 | **+17.4%** |
+| 16 | **1,079.6** | 947.0 | **+14.0%** |
+| 32 | **1,597.5** | 1,496.1 | **+6.8%** |
+
+The three reps at every point agree within 1.1% for vLLM and within 0.4% for SparkInfer.
+
+**Setup.** RTX 5090 (32 GB), `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`. Each run starts C
+streams of a 256-token prompt → 256 generated tokens, then injects one 512-token prompt → 8 tokens
+50 ms later, so a prefill lands in the middle of the batch. Greedy with EOS ignored, so every stream
+emits exactly its budget. Throughput is decode tokens ÷ wall time for the whole run.
+
+Neither side goes through HTTP. SparkInfer runs `qwen3_gguf_cb_bench` — the same
+`ContinuousBatchEngine` the server uses, with the server's defaults (NVFP4 prefill and decode, int8
+KV). vLLM runs `AsyncLLMEngine` in-process with CUDA graphs on, `max_model_len=1024`,
+`max_num_seqs=64`, and the checkpoint's own FP8 KV cache.
+
+**vLLM at 32 streams is memory-bound, and the table uses its best setting.** For this hybrid model
+vLLM sets the attention block size to 1,568 tokens so a page can hold a Gated-DeltaNet state, which
+leaves room for few sequences. At `gpu_memory_utilization=0.82` it reports a maximum concurrency of
+16 and measures 958 tok/s at 32 streams — half the requests wait. Raising it to 0.90 gives 23 and
+1,484 tok/s; **0.94 gives 27 and 1,496 tok/s**, the figure above. That last step bought 16% more room
+for under 1% more throughput, so vLLM is near its ceiling; room for all 32 would need about 0.99,
+which a 32 GB card does not have. At 16 streams and below capacity does not bind — vLLM measures
+938–950 tok/s at 16 streams on all three settings — so those rows use 0.82.
+
+Not claimed here: the HTTP servers, more than 32 streams, longer prompts, or any other engine at
+concurrency. The SGLang and DSpark tables from 0.5.4 were not re-measured for this release.
+
+### What changed in concurrent decode
+
+0.5.5's packed forward (#975) now runs its wide projections on the block-scaled NVFP4 GEMM:
+
+- the wide batch and the Gated-DeltaNet projections take the block-scaled GEMM (#990, #991), and
+  wide batches no longer fall back to the row-GEMV (#993)
+- the LM head is served from the checkpoint's own NVFP4 (#997)
+- the batch ramps up at once instead of one or two rows per iteration (#994, #1002)
+- projections are computed transposed, on a tile sized to the packed row count, LM head included
+  (#1060, #1062, #1066)
+- the continuous batch holds its Gated-DeltaNet state in bf16 (#998), runs the gate projection on
+  the side stream it already joins (#1059), and overlaps the gate and up projections (#1061)
+
+The eval now scores concurrent decode at 2, 4, 8, 16 and 32 streams (#978, #988), so a regression
+here cannot land unnoticed.
+
+### Correctness
+
+- **32K prefill: 47 of Qwen3.8's 48 Gated-DeltaNet layers took their decay gate and update rate
+  from layer 0's normalisation.** An FP4 norm deferral skipped the refresh those projections read.
+  Fixed from 32,768 tokens (#989). Between 16,384 and 32,767 the previous behaviour is kept for
+  now: the DSpark drafter is calibrated against it, and correcting it there lowered acceptance.
+- **`POST /v1/score` could score the wrong token.** The token id reached the GPU through a copy
+  that was not ordered against the kernel reading it, so the kernel could read the previous id —
+  about 22 nats off at position 1 in the report. The id is now passed by value (#1016, fixes #1001).
+- **Deterministic mode is faster and more accurate.** It still forced the non-fused GQA prefill on
+  the strength of a bug #980 had already fixed (#982).
+
+### Server
+
+**LM Studio and Ollama APIs** beside OpenAI's `/v1` (#1015):
+
+- LM Studio: `/api/v0/models`, `/api/v0/chat/completions`, `/api/v0/completions`, with LM Studio's
+  `stats`, `model_info` and `runtime` blocks
+- Ollama: `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`,
+  streamed as NDJSON
+
+Both translate around the handlers `/v1` already uses — there is no second generation path, and
+`/v1` responses are byte-identical to before. Streaming is incremental on all three. Embeddings and
+Ollama's model-management endpoints (`pull`, `push`, `create`, `copy`, `delete`) return 501 with a
+reason rather than a bare 404.
+
+**Tool schemas.** 0.5.5 said `$ref` and `$defs` return 400; they are now enforced (#985, #981).
+
+- `const`, `anyOf`, `oneOf`, `multipleOf`, `allOf`, `prefixItems`, and local `$ref` against
+  `$defs`/`definitions` are checked against the model's arguments, not merely accepted
+- `x-*` vendor extensions from MCP servers are accepted and ignored; `format` is ignored, as the
+  spec defines it as an annotation
+- an external `$ref` is refused rather than fetched, and a `$ref` with sibling keywords is refused
+  rather than silently dropping them
+- a `$ref` that points at nothing is rejected when the tool is registered, not on the first call
+  that reaches it
+- tool names fall back to a case-insensitive match — Qwen3.8 emits `Read` for an offered `read` —
+  and the call comes back under the client's own spelling
+
+Still refused: `not`, `if`/`then`/`else`, `patternProperties`, `uniqueItems`, `contains`,
+`propertyNames`, `dependentSchemas`, `dependentRequired`.
+
+`/v1/models` advertises `video` input, but only when `ffmpeg` is available to decode it (#985).
+
+### Prefill
+
+Eval-bot figures per PR, not re-measured together for this release:
+
+- 256K: the attention's V operand read in the PV layout (1.10x, #999); the six-head K operand
+  coalesced (1.06x, #1005)
+- 4K: the scored prefill attention runs on the 16K tier (1.06x, #1000)
+
+### Muse Glimmer
+
+Muse Glimmer now honours an int8 KV cache instead of writing bf16 into it (#1006). With int8 KV —
+what the example tools select at 4,096 tokens and up — it produced garbage and fell back to
+token-at-a-time prefill. The server was not affected: it keeps Muse Glimmer on bf16 KV.
+
+Beyond that fix, 35 Muse Glimmer performance PRs landed across prefill, long-context decode
+and concurrent decode. They are not benchmarked against other engines in this release.
+
+### Contributing
+
+- There is no target optimization: optimize anything, and ask for an eval axis if none measures
+  your change (#1024).
+- PRs declare their target model, and each eval bot skips PRs that cannot move its axes (#1027).
+- A PR scored `none` or `REJECT` is closed on its first result.
+
 ## [0.5.4] — 2026-09-04
 
 **SparkInfer is faster than SGLang across the matched workload matrix**, and Qwen3.8-27B now
