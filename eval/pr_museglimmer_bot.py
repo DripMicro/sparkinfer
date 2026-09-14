@@ -252,9 +252,25 @@ SCORED_CTXS = [128, 512, 4096, 16384, 32768, 65536]
 # "128 5 ... 32768 1" therefore ran 32k FIVE times (~27 min for that context alone) instead of
 # once, turning a ~14 min sweep into ~45 min and the round into ~2.5 h.
 #
-# So: one bench_sweep_run call per tier. That costs one extra model load (~1 min) and is the only
-# way to get 5 samples where a measurement is ~1s and 1 sample where it is ~330s.
-SCORED_REPS_TIERS = [([128, 512], 5), ([4096, 16384, 32768], 1), ([65536], 1)]
+# So: one bench_sweep_run call per tier, which is how differing reps were possible at all.
+#
+# 2026-09-14: every context is back to reps=5, which collapses the tiers to ONE call (and so one
+# model load instead of three -- this is now cheaper, not more expensive).
+#
+# The reps=1 tier existed because a 32k prefill took ~330s when it was written. After this week's
+# prefill work it takes 2.47s; 16k takes 1.13s. reps=5 across all six contexts costs about 48s of
+# prefill in total, so the reason to economise is gone -- and economising cost real damage:
+#
+#   #1064 scored eval-museglimmer:XL on muse-prefill@16k +96.1% and AUTO-MERGED as merge-first,
+#   on a single unaveraged baseline sample of 7442.44 pp/s. Every other round measured main at
+#   14283-14551. The PR's own 16k reading (14597) was normal, every one of its other 16 axes was
+#   flat, and the axis it actually claims (cb-decode@c8) measured -0.7%. The entire tier came from
+#   one bad baseline sample.
+#
+# This is the second time: #785 was merged and reverted for exactly this, which is why 128/512
+# went to reps=5 (596e4ed). That fix was applied to the tier that had just misfired instead of to
+# the practice, so the next context to get a bad sample repeated it.
+SCORED_REPS_TIERS = [([128, 512, 4096, 16384, 32768, 65536], 5)]
 SCORED_REPS = {c: r for ctxs, r in SCORED_REPS_TIERS for c in ctxs}
 # The GUARDS deliberately keep BENCH_REPS (5) even at 32k, and that is not an inconsistency with
 # SCORED_REPS above. Repeat count should follow how long ONE measurement takes, and that is a
