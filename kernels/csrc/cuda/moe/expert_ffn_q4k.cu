@@ -2261,6 +2261,59 @@ static inline bool launch_down_q4k_mma_rows(
         acc_scratch, expert_weights, output, H, top_k, M);
     return true;
 }
+
+// SwiGLU fold for the tensor-core gate/up below: gate partials in acc_g, up partials in h, both
+// fp32, and the same silu(gate) * up the MMVQ gate/up stores.
+__global__ void gate_up_mma_swiglu_kernel(const float* __restrict__ acc_g, float* __restrict__ h,
+                                          size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    h[i] = q4kf_silu(acc_g[i]) * h[i];
+}
+
+// Gate/up of a dense Q4_K FFN on the int8 tensor cores, for wide packed batches. The MMVQ gate/up
+// is compute-bound -- every row redoes the whole dot product -- so its cost grows with the row
+// count and at 16-32 rows it is the largest kernel of the step. down_q4k_mma_rows_kernel is
+// generic in (output rows, input width), so the same kernel serves gate and up with the two
+// swapped: F output rows over H inputs, the weights read once for the whole batch. Like the down
+// arm, NOT bit-identical to the MMVQ (the reduction order differs).
+//
+// The fp32 accumulators are the caller's, not a static slot: gate accumulates into `acc_g`
+// ([M, F]), up straight into `h` (the SwiGLU output buffer), and the fold writes h in place.
+static inline bool launch_gate_up_q4k_mma_rows(
+    const unsigned char* gate_q, const unsigned char* up_q, const int* expert_ids,
+    const float* expert_weights, const si_block_q8_1* xq8, float* acc_g, float* h,
+    int H, int F, int M, cudaStream_t stream
+) {
+    if (M < 2 || M > SI_MMA_MMAX || !acc_g || !h || (H & 255) || (F % SI_MMA_BN)) return false;
+    const size_t n = (size_t)M * F;
+    if (cudaMemsetAsync(acc_g, 0, n * sizeof(float), stream) != cudaSuccess ||
+        cudaMemsetAsync(h, 0, n * sizeof(float), stream) != cudaSuccess)
+        return false;
+    // Same K split as the down arm. At F = 17408 the output blocks alone are ~3 CTAs per SM, so
+    // it matters little here: measured flat within 1% from 1 to 8 splits at 16 and 32 rows.
+    const int nblk = H >> 8;
+    const int sk = SI_MMA_SK < nblk ? SI_MMA_SK : nblk;
+    const dim3 g(F / SI_MMA_BN, sk), blk(SI_MMA_NW * 32);
+    const int bd = si_mma_bdedup();
+    const int as = si_mma_astage(M);
+#define SI_GU_MMA(W_, ACC_) do { \
+        if (as <= 8) \
+            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<8>, W_, expert_ids, \
+                              expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
+        else if (as <= 16) \
+            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<16>, W_, expert_ids, \
+                              expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
+        else \
+            launch_pdl_kernel(0, g, blk, 0, stream, down_q4k_mma_rows_kernel<SI_MMA_MMAX>, W_, \
+                              expert_ids, expert_weights, xq8, ACC_, F, H, 1, M, 0, bd); \
+    } while (0)
+    SI_GU_MMA(gate_q, acc_g);
+    SI_GU_MMA(up_q, h);
+#undef SI_GU_MMA
+    gate_up_mma_swiglu_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(acc_g, h, n);
+    return true;
+}
 #endif
 
 // Row-batched counterpart of launch_down_q4k_mmvq_splitk. Only the generic (non shape-specialized)
@@ -2662,7 +2715,7 @@ void launch_moe_expert_ffn_q4k(
     const int* expert_ids, const float* expert_weights, void* output,
     float* h_scratch, float* out_scratch,
     int num_tokens, int top_k, int hidden, int ffn, const void* input_q8, cudaStream_t stream,
-    bool ar_exact_splitk, const void* gate_bf16, const void* up_bf16
+    bool ar_exact_splitk, const void* gate_bf16, const void* up_bf16, float* gate_acc
 ) {
     mg_sparse_ffn_init();
     // Qwythos dense hybrid fast path: pack2 gate/up without expert lookup + PDL-chained
@@ -2732,6 +2785,9 @@ void launch_moe_expert_ffn_q4k(
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
     const int gu_pdl = gu_mmvq_pdl();
+    // Whether the gate/up launch is programmatic, so the quantize that follows it may chain on it.
+    // The tensor-core gate/up below is launched plainly and clears it.
+    int gu_chain = gu_pdl;
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
     // Projections supplied by the caller: skip the whole in-projection dispatch below and go
     // straight to the SwiGLU that feeds `down`.
@@ -2756,9 +2812,25 @@ void launch_moe_expert_ffn_q4k(
         // arithmetic, same order, same result, but without the 4-warp shared-memory reduce that
         // only earns its keep when num_tokens == 1 leaves the GPU short of warps.
         const int gu_warps = gu_batch_warps();
+        // A wide packed batch of a dense Q4_K FFN whose caller supplied the gate accumulator takes
+        // the tensor-core gate/up (launch_gate_up_q4k_mma_rows). SPARKINFER_GU_MMA_MINROWS sets
+        // the floor; 0 disables the arm.
+        static const int gu_mma_min = [] {
+            const char* e = getenv("SPARKINFER_GU_MMA_MINROWS");
+            return e ? atoi(e) : 8;
+        }();
+        const bool gu_mma = gate_acc && gu_mma_min > 0 && num_tokens >= gu_mma_min && top_k == 1 &&
+            gate_type == 12 && up_type == 12 &&
+            launch_gate_up_q4k_mma_rows(reinterpret_cast<const unsigned char*>(gate_q),
+                                        reinterpret_cast<const unsigned char*>(up_q), expert_ids,
+                                        expert_weights, q, gate_acc, h_scratch, hidden, ffn,
+                                        num_tokens, stream);
+        if (gu_mma) gu_chain = 0;
         // Q3_A gate/up first: every arm below hard-codes the 144-byte Q4_K super-block, so a
         // converted tensor reaching one of them would read the wrong stride.
-        if (gate_type == SI_QTYPE_Q3A) {
+        if (gu_mma) {
+            // h_scratch already holds silu(gate) * up.
+        } else if (gate_type == SI_QTYPE_Q3A) {
             static int q3_spec = -1;
             if (q3_spec < 0) { const char* e = getenv("SPARKINFER_MUSE_Q3A_SPEC"); q3_spec = (e && e[0] == '0') ? 0 : 1; }
             // SPARKINFER_MUSE_Q3A_ROWS=0 sends a multi-row batch back to the per-token grid.
@@ -2949,7 +3021,7 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        const int q_pdl = gu_pdl && pdl;
+        const int q_pdl = gu_chain && pdl;
         launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
             quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         // split-K MMVQ down: S warps/row -> S*H warps in flight, hiding the bs=1
@@ -2980,7 +3052,7 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        const int q_pdl = gu_pdl && pdl;
+        const int q_pdl = gu_chain && pdl;
         launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
             quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
@@ -3102,7 +3174,7 @@ void launch_moe_expert_ffn_q4k(
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        const int q_pdl = gu_pdl && pdl;
+        const int q_pdl = gu_chain && pdl;
         launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
             quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
         // Row-count-aware split-K: S=8 (July-2026 sweep) is tuned for 1-row AR decode; the DFlash

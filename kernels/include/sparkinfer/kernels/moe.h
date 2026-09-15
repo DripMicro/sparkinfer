@@ -89,7 +89,11 @@ void launch_moe_expert_ffn_q4k(
     // whose cost does not grow with the batch width, while its `down` weights have no FP4 copy and
     // stay on the GEMV below. nullptr (the default) keeps the in-projection GEMV every other
     // caller wants. top_k must be 1 -- a routed MoE has no single [num_tokens, ffn] pair.
-    const void* gate_bf16 = nullptr, const void* up_bf16 = nullptr);
+    const void* gate_bf16 = nullptr, const void* up_bf16 = nullptr,
+    // [num_tokens, ffn] fp32 scratch the caller owns. When supplied, a wide batch of a dense Q4_K
+    // FFN runs gate/up on the int8 tensor cores and accumulates the gate here (the up projection
+    // accumulates in h_scratch). nullptr keeps the MMVQ gate/up.
+    float* gate_acc = nullptr);
 
 // Qwen3.6 UD shared expert: Q8_0 gate/up/down via int8 dp4a MMVQ. Reuses the FNQ
 // Q8_1(hn) buffer for gate/up; overwrites h_q8_buf with Q8_1(h) for down.

@@ -3464,6 +3464,17 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* expert_w = a.alloc<float>((size_t)NA * topk);
     float* router_logits = a.alloc<float>((size_t)NA * E);
     float* moe_h = a.alloc<float>((size_t)NA * topk * ffn);
+    // Gate accumulator for the tensor-core gate/up a wide packed step takes on a dense Q4_K FFN.
+    // Only for a stack that has one: an all-NVFP4 FFN never reads it, and Muse takes its own body.
+    const bool gu_acc_needed = packed && dense && !muse && [&] {
+        for (int L = 0; L < c.n_layers; ++L) {
+            const Qwen35LayerWeights& lw = s.w.layers[L];
+            if (lw.gate_q && lw.gate_qtype == 12 && !(lw.gate_nv && lw.up_nv && lw.down_nv))
+                return true;
+        }
+        return false;
+    }();
+    float* gu_acc = gu_acc_needed ? a.alloc<float>((size_t)NA * ffn) : nullptr;
     // out_scratch is not just the [N, H] fp32 output: launch_moe_expert_ffn_q4k also reuses it as
     // the Q8_1 staging buffer for the SwiGLU hidden, which needs
     // num_tokens * top_k * llama_q8_1_bytes(ffn) bytes. That kernel's "<= hidden floats; fits"
@@ -4708,7 +4719,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_moe_expert_ffn_q4k(hn, w.gate_q, w.up_q, w.down_q,
                                                    w.gate_qtype, w.up_qtype, w.down_qtype,
                                                    expert_ids, expert_w, routed, moe_h, moe_out,
-                                                   N, topk, H, ffn, q81, st);
+                                                   N, topk, H, ffn, q81, st, false, nullptr,
+                                                   nullptr, gu_acc);
             }
             if (L == 0) vdbg_snapshot2(routed, 3);
             // Residual + next-layer norm, matching the MoE branch's tail.
