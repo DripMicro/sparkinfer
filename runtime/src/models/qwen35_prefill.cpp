@@ -3146,6 +3146,45 @@ static bool packed_gate_up_nvfp4(const Qwen35LayerWeights& w, const void* hn, in
                                               rows, ffn, H, fp4_ws, st, w.up_fp4_alpha);
 }
 
+// Row-batched checkpoint-FP8 GEMV over ANY row count.
+//
+// launch_gemv_fp8_rows serves 2..8 rows and declines everything wider, and both of its callers
+// used to answer a decline with a bare one-row loop. That was written for the speculative verify,
+// which never exceeds eight rows, so the loop only ever caught a one-row tail. The packed
+// continuous-batch decode reuses the same projections at 16 and 32 rows -- past the cap on every
+// step -- so it fell straight to the loop and re-read the whole FP8 weight once PER ROW: sixteen
+// reads of every FP8 projection at 16 rows, thirty-two at 32.
+//
+// Walk the rows in eight-row chunks instead, and keep the one-row call only for a chunk the batched
+// kernel still declines (a one-row tail, or a shape it does not cover). Each row inside a chunk is
+// already bit-identical to its one-row call -- launch_gemv_fp8_rows keeps the same K-association,
+// per-j accumulation and ordered split sum -- so chunking changes how often the weight is read,
+// never what any row computes. Eight stays the chunk: the cost of these row kernels is the
+// activation, which a wider instantiation multiplies.
+//
+// SPARKINFER_FP8_ROWS_CHUNK=0 restores the one-row loop, for an A/B out of one binary.
+static void gemv_fp8_rows_any(const bf16* in, const void* w, bf16* out, int rows, int no, int k,
+                              cudaStream_t st) {
+    static const bool chunk = [] {
+        const char* e = getenv("SPARKINFER_FP8_ROWS_CHUNK");
+        return !(e && e[0] == '0');
+    }();
+    if (chunk) {
+        for (int r0 = 0; r0 < rows; r0 += 8) {
+            const int m = (rows - r0) < 8 ? (rows - r0) : 8;
+            const bf16* xi = in + (size_t)r0 * k;
+            bf16* yo = out + (size_t)r0 * no;
+            if (kernels::launch_gemv_fp8_rows(xi, w, yo, m, no, k, st)) continue;
+            for (int r = 0; r < m; ++r)
+                kernels::launch_gemv_fp8(xi + (size_t)r * k, w, yo + (size_t)r * no, no, k, st);
+        }
+        return;
+    }
+    if (kernels::launch_gemv_fp8_rows(in, w, out, rows, no, k, st)) return;
+    for (int r = 0; r < rows; ++r)
+        kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
+}
+
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
@@ -3629,9 +3668,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // choice, so each row is bit-identical to the one-row call it replaces. It declines the
         // shapes it cannot serve that way, and those still take the loop below.
         if (type == kernels::SI_QTYPE_FP8) {
-            if (kernels::launch_gemv_fp8_rows(in, w, out, N, no, k, st)) return true;
-            for (int r = 0; r < N; ++r)
-                kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
+            gemv_fp8_rows_any(in, w, out, N, no, k, st);
             return true;
         }
         // SI_QTYPE_NVFP4: same story one checkpoint later. The ModelOpt export
@@ -3751,8 +3788,10 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (type == kernels::SI_QTYPE_NVFP4 &&
                 kernels::launch_gemv_nvfp4_rows(in, w, out, N, no, k, ps)) return true;
-            if (type == kernels::SI_QTYPE_FP8 &&
-                kernels::launch_gemv_fp8_rows(in, w, out, N, no, k, ps)) return true;
+            if (type == kernels::SI_QTYPE_FP8) {
+                gemv_fp8_rows_any(in, w, out, N, no, k, ps);
+                return true;
+            }
             for (int r = 0; r < N; ++r) {
                 const bf16* xr = in + (size_t)r * k;
                 bf16* yr = out + (size_t)r * no;
