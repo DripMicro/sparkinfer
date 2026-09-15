@@ -48,6 +48,7 @@ jobs:
             eval/test_pr_eval_bot.py \
             eval/vast_eval.py \
             eval/pr_qwen38_bot.py \
+            eval/test_pr_qwen38_bot.py \
             bench/scripts/accuracy_compare_pair.py
 
       - name: Eval policy tests
@@ -55,3 +56,4 @@ jobs:
           set -euo pipefail
           python3 bench/scripts/test_label.py
           python3 eval/test_pr_eval_bot.py
+          python3 eval/test_pr_qwen38_bot.py

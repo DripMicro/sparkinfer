@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
-# Cron wrapper for the sparkinfer Qwen3.8-27B PR eval bot:
+# Cron wrapper for the sparkinfer Qwen3.8-27B PR eval bot (the unsloth/Qwen3.8-27B-NVFP4 checkpoint):
 #
-#   */30 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_qwen38_cron.sh >> /tmp/sparkinfer_qwen38_bot.log 2>&1
+#   30 * * * * /home/autotiny/Desktop/sparkinfer/eval/run_qwen38_cron.sh >> /tmp/sparkinfer_qwen38_bot.log 2>&1
 #
-#   Every 30 minutes, replacing the :00-only slot run_museglimmer_cron.sh used to hold —
-#   Qwen3.8-27B replaces Muse Glimmer as the scored model (eval/README.md), so the two are NOT
-#   meant to run together. If you ever reinstate the Muse Glimmer or DFlash cron alongside this
-#   one, this schedule leaves no free slot: give this one back a single hourly slot first, rather
-#   than letting two multi-hour full-GPU eval runs race for the shared lock.
+#   Hourly at :30, the slot run_dspark_cron.sh held until 2026-09-15, when the DSpark bot was
+#   paused and this bot took its place with concurrent-decode axes added (issue #1080). The Muse
+#   Glimmer bot keeps :00. Every bot drives the one pinned GPU, so two must never share a slot.
 #
-#   30 minutes comfortably fits a round. Measured on the pinned RTX 5090 (2026-08-15), per ref:
-#     build   1s no-op / 9s after a runtime/ source change / 18s after a CUDA kernel change
-#     GPU     26s decode@128 (reps=5) + 6s score dump + 29s Qwen3.6 guard (5 ctx x reps=5) = 61s
-#   so ~80s worst case per ref. A round is 1 main baseline + 1 run per pending PR, i.e. roughly
-#   3 min with one PR and ~15 min with ten. The model loads are far cheaper than they look because
-#   the bot benches decode@128, not long context: the 32k guard point dominates and still only
-#   costs seconds.
+#   A ref is one build plus: the decode@128 / prefill@16k sweep, the concurrent-decode ladder
+#   (c1..c32, median of three complete runs per width), the accuracy score dump and the Qwen3.6
+#   guard. A round is 1 main baseline + 1 run per pending PR.
 #
 #   If a round ever DOES overrun the interval (a large PR backlog), the flock below makes the
 #   overlapping tick exit 0 after 120s rather than piling up — the effect is a skipped tick, not a
@@ -29,11 +23,11 @@
 #     bots drives the ONE pinned GPU on the SAME box and would otherwise race for it if a cron
 #     tick overlaps. Wait a bounded amount instead of failing instantly: long enough to outlast a
 #     quick sibling-bot tick, short enough to still bail if something is genuinely stuck.
-#   • GPU up → full decode@128 speed + differential-accuracy eval + Qwen3.6 guard;
+#   • GPU up → full speed eval (prefill@16k, concurrent decode c1..c32, floors) + differential
+#     accuracy + Qwen3.6 guard;
 #     GPU down → --labels-only (no GPU, no ssh, pure label reconciliation).
-#   • Auto-merge stays OFF unless SPARKINFER_QWEN38_AUTOMERGE=1 is explicitly set (NOT
-#     exported here, and NOT in .env.eval by default) — this script deliberately does NOT
-#     force an auto-merge env var to 1.
+#   • Auto-merge follows SPARKINFER_QWEN38_AUTOMERGE, which .env.eval sets to 1 (explicit
+#     decision 2026-08-15). This script never forces it.
 export HOME="${HOME:-/home/autotiny}"
 export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1

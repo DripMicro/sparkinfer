@@ -178,57 +178,72 @@ SSH works → full eval of new PR commits. If the pin is stopped/unreachable →
 
 ## Qwen3.8-27B PR auto-evaluation bots
 
-> **The scored path is `pr_dspark_bot.py`** (`eval/run_dspark_cron.sh`, hourly at `:00`), and as
-> of 2026-08-21 it is the ONLY bot on cron. It scores DSpark decode and DSpark-enabled batched
-> prefill at **4k, 16k, and 32k**, plus target-model prefill at **256k**, on the ModelOpt checkpoint
-> (`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`). Every measured axis is also a no-regression
-> floor; decode is lossless against same-process AR and acceptance cannot regress materially.
-> The Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. See that file's module docstring —
-> it is the authority, not this README.
->
-> The 256k row uses `qwen3_gguf_bench` sweep mode with one exact 262,144-token context,
-> checkpoint-native NVFP4 prefill/decode representations, and INT8 KV. Main currently uses the sequential prefill
-> fallback there, so one main or PR measurement takes roughly 65 minutes on the pinned RTX 5090.
-> The hourly lock therefore skips overlapping ticks; it never starts concurrent GPU evaluations.
->
-> Every other bot here — `pr_qwen38_bot.py`, `pr_modelopt_bot.py`, `pr_museglimmer_bot.py`,
-> `pr_dflash_bot.py` — is kept for reference and run by hand only. The sections below describe
-> them as they were when they held the scored slot; each bot's own docstring is current, this
-> README is not.
+> **On cron since 2026-09-15:** `pr_qwen38_bot.py` hourly at `:30` (`eval/run_qwen38_cron.sh`),
+> beside `pr_museglimmer_bot.py` at `:00`. `pr_dspark_bot.py` held `:30` until then and is paused;
+> it still runs by hand. Each bot's module docstring is the authority, not this README.
 >
 > Only one bot may hold the shared `/tmp/sparkinfer_bot.lock` at a time, and they all drive the
-> same single pinned GPU, so two on cron would contend. The crontab is host state, not repo
-> state — check with `crontab -l` on the eval host (the machine running the bot, **not** the GPU
-> box it SSHes into) rather than trusting any schedule written down here.
+> same single pinned GPU, so two bots in one slot would contend. The crontab is host state, not
+> repo state — check with `crontab -l` on the eval host (the machine running the bot, **not** the
+> GPU box it SSHes into) rather than trusting any schedule written down here.
 
-### `pr_qwen38_bot.py` (superseded, hand-run only)
+### `pr_qwen38_bot.py` (on cron, hourly at `:30`)
 
-Scores **same-box PR vs `origin/main`** on three axes, applies
-`eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, mirrors it to `eval:*` (SN74 scoring reads `eval:*`),
-picks `qwen38-merge-first`, and can auto-merge (`SPARKINFER_QWEN38_AUTOMERGE=1`, off by default).
+Scores **same-box PR vs `origin/main`** on the upstream **`unsloth/Qwen3.8-27B-NVFP4`** checkpoint
+(a compressed-tensors directory: NVFP4 FFN, FP8 attention and Gated-DeltaNet projections). It
+applies `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, derives the generic `eval:*` tier, picks
+`qwen38-merge-first`, and auto-merges that PR when `SPARKINFER_QWEN38_AUTOMERGE=1`. A `none` or
+`REJECT` closes the PR.
 
-1. **Speed — decode @ ctx=128**, median of 5 reps. The scored checkpoint is the HuggingFace
-   **compressed-tensors NVFP4 directory** (`unsloth/Qwen3.8-27B-NVFP4`), *not* a GGUF — that is
-   what `sparkinfer-server` actually serves. `qwen3_gguf_bench`/`qwen3_gguf_score` read directories
-   via `runtime/examples/qwen_checkpoint.h`, shared with the server so the benchmark and the
-   server cannot disagree about how a checkpoint is configured.
+1. **Speed.** The tier is the best measured delta among:
+   - `prefill@16k`;
+   - **concurrent decode `cb-decode@c2/c4/c8/c16/c32`** (issue #1080): aggregate tok/s with N
+     requests in flight through `ContinuousBatchEngine`, measured as `pr_dspark_bot.py` measures
+     the ModelOpt checkpoint:
 
-   Prefill is deliberately *not* scored: at ctx=128 the batched prefill path declines (it needs
-   int8 KV, enabled only at ctx≥4096), so the number would measure the sequential fallback.
+     ```bash
+     SPARKINFER_QWEN38_PREFILL_NVFP4=1 SPARKINFER_QWEN38_DECODE_NVFP4=1 SPARKINFER_KV_INT8=1 \
+       build/runtime/qwen3_gguf_cb_bench <checkpoint> N 256 256 512
+     ```
+
+   `decode@128`, `prefill@128` and `cb-decode@c1` are measured as floors. Any measured dimension
+   below 98% of `main` is a hard REJECT.
+
+   This checkpoint's packed decode step runs FP8 and Q4_K kernels that the ModelOpt checkpoint never
+   uses, and no other bot measures concurrency on it. `main` (`507017b`), aggregate tok/s:
+
+   | requests | 1 | 2 | 4 | 8 | 16 | 32 |
+   |---|--:|--:|--:|--:|--:|--:|
+   | tok/s | 83.0 | 155.9 | 259.0 | 421.9 | 314.1 | ~249 |
+
+   Throughput falls past 8 requests, and at 32, two of the 33 requests fail to open (out of
+   memory). Each width is the **median of three complete runs**. A run counts as complete only if
+   every request either finished or failed outright; a run where requests stopped part-way is
+   re-run, up to five attempts. One such run on `main` read 293 tok/s at c32 instead of ~249. Single
+   runs of identical code at c32 differ by up to 2.7%, which is outside the 2% reject band.
 
 2. **Accuracy gate — differential (PR vs main), not absolute.** llama.cpp cannot read a
    compressed-tensors directory, so there is no same-weights external reference. Instead both
    builds score the same token stream and the two distributions are compared
-   (`bench/scripts/accuracy_compare_pair.py`): **top1 ≥ 0.99, KL ≤ 0.01**. Tight, because two
-   builds of the same model on the same box should agree almost exactly. Failure is a hard
-   REJECT regardless of speed.
+   (`bench/scripts/accuracy_compare_pair.py`): **top1 ≥ 0.99, KL ≤ 0.01**. Failure is a hard
+   REJECT regardless of speed. *Limitation:* it catches newly introduced divergence only — never a
+   bug already present on `main`.
 
-   *Limitation:* a differential gate catches newly introduced divergence only — never a bug
-   already present on `main`.
+   The batched-prefill parity gate (`bench/scripts/prefill_parity_check.py`) is **not run**. It is
+   absolute, and `main` fails it on this checkpoint: a common prefix of 3–4 of 24 tokens at n=32
+   and n=128, against a 0.75 bar. Running it would reject every PR. `pr_dspark_bot.py` turned it
+   off on the ModelOpt checkpoint for the same reason.
 
 3. **Qwen3.6 no-regression guard** — decode + prefill at ctx 0/512/4k/16k/32k, 0.98 tolerance.
    Qwen3.8 and Qwen3.6 share `qwen35.cpp`/`inference_engine.cpp`; a regression there is a hard
    REJECT regardless of Qwen3.8's own result.
+
+**Not evaluated:**
+- PRs whose template declares a different target model (#1027).
+- PRs that change the measuring harness: `qwen3_gguf_bench.cpp`, `qwen3_gguf_cb_bench.cpp`,
+  `qwen_checkpoint.h`, `qwen3_gguf_config.h`, `eval/` or `bench/scripts/`.
+
+Every ref, `main` included, is built with `main`'s copy of those files.
 
 ```bash
 python eval/pr_qwen38_bot.py --repo gittensor-ai-lab/sparkinfer   # one poll
@@ -236,8 +251,20 @@ python eval/pr_qwen38_bot.py --only-prs 636 --reeval              # re-score one
 python eval/pr_qwen38_bot.py --labels-only                        # no GPU, reconcile labels only
 ```
 
-Box paths are `QWEN38_*` in `.env.eval` (`QWEN38_MODEL_DIR` defaults to
-`/root/workspace/models_qwen38`).
+Box paths are `QWEN38_*` in `.env.eval`. `QWEN38_MODEL_DIR` defaults to
+`/root/workspace/models_qwen38`. On the current box `QWEN38_REMOTE_REPO` shares the DSpark bot's
+clone, `/workspace/eval/bot_repo`, because the disk has no room for a second checkout.
+
+### `pr_dspark_bot.py` (paused 2026-09-15, run by hand)
+
+Scores DSpark decode and DSpark-enabled batched prefill at **4k, 16k, and 32k**, target-model
+prefill and decode at **256k**, and concurrent decode at c2–c32, all on the ModelOpt checkpoint
+(`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090`). Every measured axis is also a no-regression
+floor; decode is lossless against same-process AR and acceptance cannot regress materially. The
+Qwen3.6 / Qwen3.8 shared-path guards remain mandatory. To resume it, put
+`eval/run_dspark_cron.sh` back on `:30` and move `run_qwen38_cron.sh` off that slot first.
+
+`pr_modelopt_bot.py` and `pr_dflash_bot.py` are kept for reference and run by hand only.
 
 ## DFlash PR auto-evaluation bot (retired from cron)
 
