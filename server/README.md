@@ -72,6 +72,30 @@ hand off to lossless autoregressive decoding. `/metrics` exposes
 `sparkinfer_speculative_runs_total`, `sparkinfer_speculative_tokens_total`, and
 `sparkinfer_speculative_handoffs_total` so this is observable in production.
 
+### Serve a GGUF instead of NVFP4
+
+The server also loads Qwen3.8-27B from a GGUF, for example unsloth's
+[`Qwen3.8-27B-UD-Q4_K_M.gguf`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (16.5 GB). Point
+`-m` at the file. GGUF repos do not ship a `tokenizer.json`, so pass the one from any Qwen3.8 HF
+checkpoint:
+
+```bash
+./build/server/sparkinfer_server \
+  -m models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --tokenizer models/Qwen3.8-27B-NVFP4-RTX5090/tokenizer.json \
+  --ctx 32768 --host 0.0.0.0 --port 8080
+```
+
+Compared with the NVFP4 checkpoints:
+
+- **Text only.** The vision tower loads from an HF checkpoint directory, so a GGUF target returns
+  `400` for image and video input.
+- **Slower prefill on short prompts.** Reading Q4_K means dequantizing it into the matrix-multiply
+  operand on every prefill pass. That fixed cost dominates at 128 tokens and is amortized by 4k; see
+  [Same weights, GGUF on both sides](../README.md#same-weights-gguf-on-both-sides) for the numbers.
+- **DSpark is only measured with the NVFP4 target.**
+- **The release container serves the NVFP4 checkpoint.** A GGUF target needs a source build.
+
 ## API
 
 | Endpoint | Description |
