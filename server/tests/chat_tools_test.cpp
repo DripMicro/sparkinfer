@@ -1189,6 +1189,27 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_request_controls_sampling_set_flags() {
+    // #1088: an omitted sampling control must stay distinguishable from an explicit one, so the
+    // server can fill in the checkpoint's generation_config.json values without overriding a client
+    // that asked for greedy decoding.
+    RequestControls omitted;
+    std::string err;
+    CHECK(parse_request_controls(R"({})", omitted, err));
+    CHECK(!omitted.temperature_set && !omitted.top_k_set && !omitted.top_p_set);
+    RequestControls explicit_greedy;
+    CHECK(parse_request_controls(R"({"temperature":0,"top_k":0,"top_p":1.0})", explicit_greedy, err));
+    CHECK(explicit_greedy.temperature_set && explicit_greedy.top_k_set && explicit_greedy.top_p_set);
+    CHECK(explicit_greedy.temperature == 0.f);
+    RequestControls only_top_p;
+    CHECK(parse_request_controls(R"({"top_p":0.9})", only_top_p, err));
+    CHECK(!only_top_p.temperature_set && only_top_p.top_p_set && !only_top_p.top_k_set);
+    RequestControls nulls;
+    CHECK(parse_request_controls(R"({"temperature":null,"top_k":null})", nulls, err));
+    CHECK(!nulls.temperature_set && !nulls.top_k_set);
+    return true;
+}
+
 bool test_request_controls_temperature_validation() {
     RequestControls controls;
     std::string err;
@@ -1949,6 +1970,7 @@ int main() {
     if (!test_validate_response_format_json_object()) return 1;
     if (!test_validate_response_format_json_schema()) return 1;
     if (!test_request_controls_temperature_validation()) return 1;
+    if (!test_request_controls_sampling_set_flags()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;

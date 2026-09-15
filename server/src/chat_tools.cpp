@@ -1507,6 +1507,7 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             return false;
         }
         out.temperature = static_cast<float>(t);
+        out.temperature_set = true;
     }
     if (root.contains("seed") && !root["seed"].is_null()) {
         const auto& value = root["seed"];
@@ -1539,6 +1540,7 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             return false;
         }
         out.top_p = static_cast<float>(p);
+        out.top_p_set = true;
     }
     if (root.contains("top_k") && !root["top_k"].is_null()) {
         const auto& value = root["top_k"];
@@ -1552,6 +1554,7 @@ bool parse_request_controls(const std::string& body, RequestControls& out, std::
             return false;
         }
         out.top_k = static_cast<int>(std::min<long long>(k, std::numeric_limits<int>::max()));
+        out.top_k_set = true;
     }
     if (root.contains("presence_penalty") && !root["presence_penalty"].is_null()) {
         const auto& value = root["presence_penalty"];

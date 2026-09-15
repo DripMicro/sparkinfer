@@ -153,6 +153,12 @@ struct RequestControls {
     // ContinuousBatchEngine::Request's doc comment for the inertness proof.
     int top_k = 0;
     float top_p = 1.0f;
+    // Whether the request itself set temperature / top_k / top_p. A request that leaves one out gets
+    // the checkpoint's recommended value (generation_config.json) instead of the struct default
+    // above -- see apply_sampling_defaults in sparkinfer_server.cpp (#1088).
+    bool temperature_set = false;
+    bool top_k_set = false;
+    bool top_p_set = false;
     // [-2.0, 2.0]; 0 (default, OpenAI's own default) disables both. Sampling controls, same tier
     // as temperature/top_k/top_p (NOT logprobs, which is pure output reporting) -- threaded
     // through every complete_streaming call site, including the json_mode/tool-calling retry

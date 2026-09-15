@@ -52,6 +52,70 @@ int max_output_tokens() {
     return v;
 }
 
+// Sampling for requests that leave temperature / top_k / top_p out (#1088). They used to be decoded
+// greedily. Agent clients such as pi (prime-agent) send none of them, and a thinking model decoded
+// greedily falls into repetition loops on long tasks -- Qwen's own guidance is not to use greedy
+// decoding for thinking mode. llama.cpp samples by default and vLLM applies generation_config.json,
+// so the same requests behaved differently there. The checkpoint's generation_config.json values
+// now fill in whatever a request omits; an explicit value, including temperature 0, always wins.
+// Greedy stays the default with SPARKINFER_SAMPLING_DEFAULTS=greedy, when the checkpoint has no such
+// file (a GGUF), and under SPARKINFER_DETERMINISTIC=1, whose bit-reproducibility a random per-request
+// seed would break.
+struct SamplingDefaults {
+    bool active = false;
+    float temperature = 0.f;
+    int top_k = 0;
+    float top_p = 1.0f;
+};
+SamplingDefaults g_sampling_defaults;
+
+void load_sampling_defaults(const std::string& model_path) {
+    const char* mode = getenv("SPARKINFER_SAMPLING_DEFAULTS");
+    const std::string m = mode ? mode : "generation_config";
+    auto greedy = [](const std::string& why) {
+        fprintf(stderr, "[sparkinfer-server] sampling defaults: greedy for requests that omit "
+                        "temperature/top_k/top_p (%s)\n", why.c_str());
+    };
+    if (m == "greedy") return greedy("SPARKINFER_SAMPLING_DEFAULTS=greedy");
+    if (m != "generation_config") {
+        fprintf(stderr, "[sparkinfer-server] SPARKINFER_SAMPLING_DEFAULTS=%s is not greedy or "
+                        "generation_config -- using generation_config\n", m.c_str());
+    }
+    if (sparkinfer::deterministic_mode()) return greedy("SPARKINFER_DETERMINISTIC=1");
+    std::ifstream f(model_path + "/generation_config.json");
+    if (!f) return greedy("no generation_config.json beside the checkpoint");
+    nlohmann::json g;
+    try { f >> g; } catch (const std::exception& e) {
+        return greedy(std::string("generation_config.json unreadable: ") + e.what());
+    }
+    if (g.contains("do_sample") && g["do_sample"].is_boolean() && !g["do_sample"].get<bool>())
+        return greedy("generation_config.json has do_sample=false");
+    SamplingDefaults d;
+    if (g.contains("temperature") && g["temperature"].is_number()) {
+        const double t = g["temperature"].get<double>();
+        if (t >= 0.0 && t <= 2.0) d.temperature = static_cast<float>(t);
+    }
+    if (g.contains("top_k") && g["top_k"].is_number_integer() && g["top_k"].get<long long>() >= 0)
+        d.top_k = static_cast<int>(std::min<long long>(g["top_k"].get<long long>(), 1 << 20));
+    if (g.contains("top_p") && g["top_p"].is_number()) {
+        const double p = g["top_p"].get<double>();
+        if (p > 0.0 && p <= 1.0) d.top_p = static_cast<float>(p);
+    }
+    if (d.temperature <= 0.f) return greedy("generation_config.json sets no positive temperature");
+    d.active = true;
+    g_sampling_defaults = d;
+    fprintf(stderr, "[sparkinfer-server] sampling defaults from generation_config.json: temperature=%.2f "
+                    "top_k=%d top_p=%.2f for requests that omit them (SPARKINFER_SAMPLING_DEFAULTS=greedy "
+                    "to decode those greedily)\n", d.temperature, d.top_k, d.top_p);
+}
+
+void apply_sampling_defaults(sparkinfer_server::RequestControls& c) {
+    if (!g_sampling_defaults.active) return;
+    if (!c.temperature_set) c.temperature = g_sampling_defaults.temperature;
+    if (!c.top_k_set) c.top_k = g_sampling_defaults.top_k;
+    if (!c.top_p_set) c.top_p = g_sampling_defaults.top_p;
+}
+
 int sse_keepalive_seconds() {
     static int v = [] {
         const char* e = getenv("SPARKINFER_SSE_KEEPALIVE_SECONDS");
@@ -918,6 +982,7 @@ int main(int argc, char** argv) {
 
     sparkinfer_server::ModelEngine engine;
     if (!engine.load(model_path, ctx > 0 ? ctx : 0)) return 1;
+    load_sampling_defaults(model_path);
 
     // Name what was actually loaded. Without this the server reports "qwen3.6-35b-a3b" whatever
     // it is serving -- a client asking Qwen3.8 a question is told it spoke to Qwen3.6, and every
@@ -1493,6 +1558,7 @@ int main(int argc, char** argv) {
                  // The HTTP server runs ContinuousBatchEngine, whose request path is currently
                  // autoregressive even when the standalone DFlash benchmark env var is present.
                  // Do not reject valid OpenAI sampling controls based on an unrelated process env.
+                 apply_sampling_defaults(controls);
                  if (!controls.seed_set) {
                      static thread_local std::random_device rd;
                      controls.seed = ((uint64_t)rd() << 32) | rd();
@@ -2658,6 +2724,7 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
+                 apply_sampling_defaults(controls);
                  if (!controls.seed_set) {
                      static thread_local std::random_device rd;
                      controls.seed = ((uint64_t)rd() << 32) | rd();
