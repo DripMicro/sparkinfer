@@ -65,6 +65,12 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               inference_engine.cpp, and that shared surface is exactly how PR #775 regressed a
               model nobody was scoring at the time.
 
+  3b. ModelOpt Qwen3.8 and Muse Glimmer no-regression guards — decode + prefill at 32k each, the
+              same pair pr_museglimmer_bot.py guards, with the same hard REJECT. The Muse bot skips
+              PRs declared for Qwen3.8 alone (since #1082), so this bot is the only check those PRs
+              get against either model. A checkpoint missing from the box is skipped and reported,
+              never rejected.
+
 Applies `eval-qwen38:<TIER>` AND mirrors it to the generic `eval:<TIER>` label (SN74 scoring reads
 eval:* tiers). Auto-close on none/REJECT is live; auto-merge stays OFF unless
 SPARKINFER_QWEN38_AUTOMERGE=1 is explicitly set.
@@ -185,7 +191,8 @@ QWEN38_NEEDS_REBASE = "qwen38-needs-rebase"
 # First schema for this bot. Same reasoning as the sibling bots' own bumps: a PR evaluated before
 # a scoring change existed must not keep a stale-scored label/score forever.
 # v2 (2026-09-15): concurrent-decode axes added (issue #1080), and the harness is taken from main.
-EVAL_SCHEMA_VERSION = "v2-unsloth-concurrency"
+# v3 (2026-09-15): ModelOpt Qwen3.8 and Muse Glimmer no-regression guards added.
+EVAL_SCHEMA_VERSION = "v3-unsloth-concurrency-cross-model-guards"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -228,6 +235,25 @@ Q36_GUARD_MODEL_FILE = os.environ.get("Q36_GUARD_MODEL_FILE", "Qwen3.6-35B-A3B-U
 Q36_GUARD_MODEL_REPO = os.environ.get("PRIMARY36_MODEL_REPO", "unsloth/Qwen3.6-35B-A3B-GGUF")
 Q36_GUARD_TOK_REPO = os.environ.get("PRIMARY36_TOK_REPO", "Qwen/Qwen3.6-35B-A3B")
 GUARD_CTX_LABEL = {0: "128", 512: "512", 4096: "4k", 16384: "16k", 32768: "32k"}
+
+# Cross-model no-regression guards beside Qwen3.6, decode AND prefill at 32k (2026-09-15): the same
+# two checkpoints and the same shape pr_museglimmer_bot.py guards. This bot scores packed-decode and
+# prefill work on code those models share, and the Muse bot skips PRs declared for Qwen3.8 alone
+# (#1082), so without these nothing checks such a PR against either model -- #1081, #1082 and #1083
+# all auto-merged that way.
+#
+#   ModelOpt Qwen3.8-27B NVFP4   the checkpoint the release container serves and the DSpark bot scores
+#   Muse Glimmer 30B (GGUF)      the model the Muse bot scores
+#
+# Same env var names as those bots, so one .env.eval entry serves all of them. A checkpoint absent
+# from the box is SKIPPED and says so -- never a REJECT, never a silent pass.
+MODELOPT_GUARD_MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace/models_q38_modelopt")
+MODELOPT_GUARD_CTXS = [32768]
+MUSE_GUARD_GGUF = os.environ.get(
+    "MUSEGLIMMER_GGUF", "/root/workspace/models_muse_glimmer/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf")
+MUSE_GUARD_CTXS = [32768]
+# reps=5 (median), as for the Qwen3.6 guard: a guard that hard-REJECTs must not act on one sample.
+GUARD_REPS = 5
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
@@ -349,15 +375,16 @@ def _cb_table(res: dict) -> str:
             "|---|--:|--:|--:|--:|\n" + "\n".join(rows) + "\n\n")
 
 
-def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
-    """No-regression check: PR vs same-box main, Qwen3.6 only, decode + prefill, every measured
-    context. Adapted from pr_dflash_bot.py's check_qwen_guard (its qwen3.5/Qwythos half dropped —
-    scoped to qwen3.6 only per explicit instruction, module docstring pt. 3). Returns
+def _check_model_guard(pr: dict, main: dict, key: str, model: str, tol: float = REGRESS_TOL):
+    """No-regression check for ONE guarded model: PR vs same-box main, decode + prefill, every
+    measured context. `key` is the _parse_remote dict key holding that model's per-context numbers
+    and `model` its display name, so every guard is the SAME code -- the pr_museglimmer_bot.py
+    shape, which exists because a duplicated guard can quietly stop guarding. Returns
     (ok, [human-readable regression/failure strings])."""
     problems = []
-    if pr.get("guard36_failed") or main.get("guard36_failed") or not pr.get("guard36") or not main.get("guard36"):
-        problems.append("qwen3.6 guard measurement unavailable")
-    pr_ctxs, main_ctxs = pr.get("guard36") or {}, main.get("guard36") or {}
+    if pr.get(f"{key}_failed") or main.get(f"{key}_failed") or not pr.get(key) or not main.get(key):
+        problems.append(f"{model} guard measurement unavailable")
+    pr_ctxs, main_ctxs = pr.get(key) or {}, main.get(key) or {}
     # Iterate over MAIN's contexts (the reference set) — a PR build that crashes partway through
     # its own sweep must not make that context silently uncheckable. Fail closed: a real main
     # baseline (base > 0) with a missing/zero PR measurement (cur <= 0) is a regression, not a skip.
@@ -371,17 +398,32 @@ def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
             cur = pr_vals.get(metric, 0)
             if cur <= 0:
                 problems.append(
-                    f"qwen3.6 {metric}@{label}: PR measurement missing/zero "
+                    f"{model} {metric}@{label}: PR measurement missing/zero "
                     f"(main {base:.1f}) — treated as regression"
                 )
                 continue
             if cur < base * tol:
                 pct = 100.0 * (cur - base) / base
                 problems.append(
-                    f"qwen3.6 {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
+                    f"{model} {metric}@{label}: {cur:.1f} < {100 * tol:.0f}% of main "
                     f"{base:.1f} ({pct:+.1f}%)"
                 )
     return (len(problems) == 0, problems)
+
+
+def check_q36_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Qwen3.6 no-regression guard (module docstring pt. 3), decode + prefill at ctx 0..32k."""
+    return _check_model_guard(pr, main, "guard36", "qwen3.6", tol)
+
+
+def check_modelopt_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """ModelOpt Qwen3.8-27B NVFP4 no-regression guard (pt. 3b), decode + prefill @ 32k."""
+    return _check_model_guard(pr, main, "guardmo", "modelopt", tol)
+
+
+def check_muse_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Muse Glimmer 30B no-regression guard (pt. 3b), decode + prefill @ 32k."""
+    return _check_model_guard(pr, main, "guardmg", "muse glimmer", tol)
 
 
 def qwen38_evaluated_commits(repo, num):
@@ -611,6 +653,12 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     cb_long_tokens = CB_LONG_TOKENS
     cb_reps = CB_REPS
     cb_max_attempts = CB_MAX_ATTEMPTS
+    mo_dir = shlex.quote(MODELOPT_GUARD_MODEL_DIR)
+    muse_gguf = shlex.quote(MUSE_GUARD_GGUF)
+    mo_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in MODELOPT_GUARD_CTXS)
+    mo_ctx_list = " ".join(str(c) for c in MODELOPT_GUARD_CTXS)
+    mg_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in MUSE_GUARD_CTXS)
+    mg_ctx_list = " ".join(str(c) for c in MUSE_GUARD_CTXS)
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently -- same diagnostic trap as the sibling
@@ -656,6 +704,8 @@ Q36_GUARD_MODELS_DIR={q36_dir}
 Q36_GUARD_MODEL_FILE={q36_file}
 Q36_GUARD_MODEL_REPO={q36_repo}
 Q36_GUARD_TOK_REPO={q36_tok}
+MODELOPT_GUARD_MODEL_DIR={mo_dir}
+MUSE_GUARD_GGUF={muse_gguf}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -902,6 +952,38 @@ if bench_sweep_run "$Q36_GGUF" 128 0 5 512 5 4096 5 16384 5 32768 5; then
 else
   echo "GUARD36_FAILED"
 fi
+
+# --- ModelOpt Qwen3.8-27B NVFP4 no-regression guard (decode + prefill @ 32k) ---
+# Same block as pr_museglimmer_bot.py's. A compressed-tensors directory; qwen3_gguf_bench reads
+# either kind. Skipped, not failed, when the checkpoint is absent from the box.
+if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$MODELOPT_GUARD_MODEL_DIR" 128 {mo_sweep_args}; then
+    for ctx in {mo_ctx_list}; do
+      echo "GUARDMO $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARDMO_FAILED"
+  fi
+else
+  echo "GUARDMO_UNAVAILABLE"
+fi
+
+# --- Muse Glimmer 30B no-regression guard (decode + prefill @ 32k) ---
+# The model pr_museglimmer_bot.py scores, measured the way that bot measures it: qwen3_gguf_bench
+# on the GGUF with no env pins. Skipped, not failed, when the GGUF is absent from the box.
+if [ -f "$MUSE_GUARD_GGUF" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$MUSE_GUARD_GGUF" 128 {mg_sweep_args}; then
+    for ctx in {mg_ctx_list}; do
+      echo "GUARDMG $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARDMG_FAILED"
+  fi
+else
+  echo "GUARDMG_UNAVAILABLE"
+fi
 echo "GUARD_END"
 """
 
@@ -914,6 +996,7 @@ def _parse_remote(stdout: str) -> dict:
     fewer place for the two to disagree about what was measured."""
     out = {}
     guard36 = {}
+    cross_guards = {"GUARDMO": {}, "GUARDMG": {}}
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
@@ -977,7 +1060,21 @@ def _parse_remote(stdout: str) -> dict:
                     pass
         elif line.strip() == "GUARD36_FAILED":
             out["guard36_failed"] = True
+        elif line.split(" ", 1)[0] in cross_guards:
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    cross_guards[parts[0]][int(parts[1])] = {"decode": float(parts[2]),
+                                                             "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() in ("GUARDMO_FAILED", "GUARDMG_FAILED"):
+            out[line.strip().split("_")[0].lower() + "_failed"] = True
+        elif line.strip() in ("GUARDMO_UNAVAILABLE", "GUARDMG_UNAVAILABLE"):
+            out[line.strip().split("_")[0].lower() + "_unavailable"] = True
     out["guard36"] = guard36
+    out["guardmo"] = cross_guards["GUARDMO"]
+    out["guardmg"] = cross_guards["GUARDMG"]
     return out
 
 
@@ -1269,6 +1366,21 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    # ModelOpt and Muse Glimmer guards (pt. 3b): same discipline, same hard REJECT. An absent
+    # checkpoint is a SKIP, reported as one, so a round that guarded nothing never reads as a pass.
+    cross = {}
+    for key, name, check in (("guardmo", "modelopt", check_modelopt_guard),
+                             ("guardmg", "muse glimmer", check_muse_guard)):
+        skipped = bool(pr.get(f"{key}_unavailable") or main.get(f"{key}_unavailable"))
+        ok, problems = (True, []) if skipped else check(pr, main)
+        if skipped:
+            print(f">> {name} guard SKIPPED — checkpoint not installed on the box")
+        if not ok:
+            reason = f"{name} no-regression guard failed: " + "; ".join(problems[:6]) + f" | {reason}"
+            label = "REJECT"
+            passed = False
+        cross[key] = (ok, problems, skipped)
+
     res = {
         "ok": True,
         "label": label,
@@ -1303,6 +1415,12 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "q36_guard_problems": q36_problems,
         "q36_guard": pr.get("guard36"),
         "q36_guard_main": main.get("guard36"),
+        "modelopt_guard_ok": cross["guardmo"][0],
+        "modelopt_guard_problems": cross["guardmo"][1],
+        "modelopt_guard_skipped": cross["guardmo"][2],
+        "muse_guard_ok": cross["guardmg"][0],
+        "muse_guard_problems": cross["guardmg"][1],
+        "muse_guard_skipped": cross["guardmg"][2],
         "pr_head": pr.get("head"),
         "main_head": main.get("head"),
     }
@@ -1339,6 +1457,8 @@ def format_comment(commit: str, res: dict) -> str:
         "pass": res.get("pass"),
         "accuracy_ok": res.get("accuracy_ok"),
         "q36_guard_ok": res.get("q36_guard_ok"),
+        "modelopt_guard_ok": res.get("modelopt_guard_ok"),
+        "muse_guard_ok": res.get("muse_guard_ok"),
     }
     marker = (
         f"<!-- sparkinfer-qwen38-eval:{EVAL_SCHEMA_VERSION}:{commit} "
@@ -1367,6 +1487,19 @@ def format_comment(commit: str, res: dict) -> str:
         problems = "; ".join((res.get("q36_guard_problems") or [])[:4])
         q36_row = (f"| qwen3.6 guard | ❌ **FAILED** — {problems} — "
                     "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+    cross_rows = ""
+    for prefix, name, what in (("modelopt", "modelopt guard", "Qwen3.8-27B NVFP4 (ModelOpt)"),
+                               ("muse", "muse glimmer guard", "Muse Glimmer 30B")):
+        if res.get(f"{prefix}_guard_skipped"):
+            # Say SKIPPED explicitly: a guard that reports nothing reads the same as one that passed.
+            cross_rows += (f"| {name} | ⚠️ SKIPPED — checkpoint not installed on the box; "
+                           f"shared-code regressions on {what} were NOT checked |\n")
+        elif res.get(f"{prefix}_guard_ok"):
+            cross_rows += f"| {name} | ✅ no regression (decode+prefill @ 32k, {what}) |\n"
+        else:
+            probs = "; ".join((res.get(f"{prefix}_guard_problems") or [])[:4])
+            cross_rows += (f"| {name} | ❌ **FAILED** — {probs} — "
+                           "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -1396,6 +1529,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{acc_row}"
         f"{main_acc_note}"
         f"{q36_row}"
+        f"{cross_rows}"
         f"| PPL PR / main | {res.get('pr_ppl') or '?'} / {res.get('main_ppl') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
@@ -1405,9 +1539,10 @@ def format_comment(commit: str, res: dict) -> str:
         "`unsloth/Qwen3.8-27B-NVFP4` checkpoint, with the measuring harness taken from `main`. "
         "Every measured dimension is also a no-regression floor; otherwise the label is the best "
         "tier among prefill@16k and concurrent decode @c2–c32. Accuracy is differential: this "
-        "build and `main` score the same token stream and must agree. Also gated on a Qwen3.6 "
-        "no-regression guard (decode+prefill, ctx 0/512/4k/16k/32k), because Qwen3.8 PRs can touch "
-        "code shared with other models. A `none` label means no measurable speedup on these axes, "
+        "build and `main` score the same token stream and must agree. Also gated on no-regression "
+        "guards for Qwen3.6 (decode+prefill, ctx 0/512/4k/16k/32k) and for the ModelOpt Qwen3.8 "
+        "checkpoint and Muse Glimmer (decode+prefill @ 32k), because Qwen3.8 PRs can touch code "
+        "shared with other models. A `none` label means no measurable speedup on these axes, "
         "which is expected if that is not what your change is about.</sub>\n"
     )
 
@@ -1461,7 +1596,7 @@ def try_auto_merge_qwen38(repo, num):
                 "<!-- sparkinfer-qwen38-automerge -->\n"
                 "Auto-merged as the round's `qwen38-merge-first` winner — verified same-box "
                 "speedup over `main` on the unsloth checkpoint, with every floor, the differential "
-                "accuracy gate and the Qwen3.6 guard passing."])
+                "accuracy gate and the Qwen3.6, ModelOpt and Muse Glimmer guards passing."])
         return True
     print(f">> qwen38 auto-merge BLOCKED #{num}: {(r.stderr or r.stdout or '')[:200]}")
     return False
@@ -1546,6 +1681,10 @@ def upload_qwen38_eval_log(repo, num, title, oid, res):
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"), "q36_guard_problems": res.get("q36_guard_problems"),
+            "modelopt_guard_ok": res.get("modelopt_guard_ok"), "modelopt_guard_problems": res.get("modelopt_guard_problems"),
+            "modelopt_guard_skipped": res.get("modelopt_guard_skipped"),
+            "muse_guard_ok": res.get("muse_guard_ok"), "muse_guard_problems": res.get("muse_guard_problems"),
+            "muse_guard_skipped": res.get("muse_guard_skipped"),
             "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
@@ -1598,7 +1737,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
           f"from={res.get('scored_dimension')}  "
           f"top1={res.get('pr_top1')} kl={res.get('pr_kl')}  "
           f"delta={res.get('delta_pct')}%  accuracy_ok={res.get('accuracy_ok')}  "
-          f"q36_guard_ok={res.get('q36_guard_ok')}")
+          f"q36_guard_ok={res.get('q36_guard_ok')}  modelopt_guard_ok={res.get('modelopt_guard_ok')}  "
+          f"muse_guard_ok={res.get('muse_guard_ok')}")
     if dry_run:
         print(body[:500])
         return
@@ -1641,6 +1781,8 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "pass": res.get("pass"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"),
+            "modelopt_guard_ok": res.get("modelopt_guard_ok"),
+            "muse_guard_ok": res.get("muse_guard_ok"),
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
@@ -1658,6 +1800,10 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         if label in ("none", "REJECT"):
             if not res.get("q36_guard_ok", True):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
+            elif not res.get("modelopt_guard_ok", True):
+                fail_clause = "and regressed the ModelOpt Qwen3.8 no-regression guard (decode/prefill @ 32k)"
+            elif not res.get("muse_guard_ok", True):
+                fail_clause = "and regressed the Muse Glimmer no-regression guard (decode/prefill @ 32k)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
             elif res.get("regressed_dims"):
@@ -1691,7 +1837,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
                     f"Measured **{res.get('delta_pct')}%** vs the same-box `origin/main`, "
                     f"{fail_clause} — closing automatically.\n\n"
                     "Every measured axis is also a no-regression floor, and accuracy and the "
-                    "Qwen3.6 guard are hard gates, so one failure closes the PR whatever it was "
+                    "Qwen3.6, ModelOpt and Muse Glimmer guards are hard gates, so one failure closes the PR whatever it was "
                     "aiming at. The verdict comment above names which one. Reopen once it is "
                     "addressed and it re-evaluates on the next poll."
                 )

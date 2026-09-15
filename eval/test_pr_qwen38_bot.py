@@ -105,5 +105,66 @@ class ConcurrencyAxesTests(unittest.TestCase):
         self.assertEqual(out["cb32_runs"], [246.3, 250.2, 247.9])
         self.assertEqual(out["cb32_agg"], 247.9)
 
+
+class CrossModelGuardTests(unittest.TestCase):
+    """ModelOpt Qwen3.8 and Muse Glimmer no-regression guards, the pair pr_museglimmer_bot.py runs.
+    The Muse bot skips Qwen3.8-only PRs, so this bot is the only check they get on either model."""
+
+    MAIN = {"guard36": {32768: {"decode": 460.0, "prefill": 24800.0}},
+            "guardmo": {32768: {"decode": 90.0, "prefill": 13000.0}},
+            "guardmg": {32768: {"decode": 98.0, "prefill": 11000.0}}}
+
+    def test_remote_script_runs_both_guards_before_the_end_marker(self):
+        script = bot._remote_script("main", role="main")
+        self.assertIn('bench_sweep_run "$MODELOPT_GUARD_MODEL_DIR" 128 32768 5', script)
+        self.assertIn('bench_sweep_run "$MUSE_GUARD_GGUF" 128 32768 5', script)
+        for marker in ("GUARDMO $ctx", "GUARDMO_FAILED", "GUARDMO_UNAVAILABLE",
+                       "GUARDMG $ctx", "GUARDMG_FAILED", "GUARDMG_UNAVAILABLE"):
+            self.assertIn(marker, script)
+        # GUARD_END is the hard-kill retry's end-of-run marker, so it must come after both guards.
+        self.assertLess(script.index("GUARDMG_UNAVAILABLE"), script.index('echo "GUARD_END"'))
+        self.assertIn("v3", bot.EVAL_SCHEMA_VERSION)
+
+    def test_guard_lines_parse(self):
+        out = bot._parse_remote("GUARDMO 32768 90.5 13010.0\nGUARDMG 32768 97.9 10990.0\n")
+        self.assertEqual(out["guardmo"], {32768: {"decode": 90.5, "prefill": 13010.0}})
+        self.assertEqual(out["guardmg"], {32768: {"decode": 97.9, "prefill": 10990.0}})
+        failed = bot._parse_remote("GUARDMO_FAILED\nGUARDMG_UNAVAILABLE\n")
+        self.assertTrue(failed["guardmo_failed"])
+        self.assertTrue(failed["guardmg_unavailable"])
+
+    def test_a_regression_or_missing_measurement_fails_the_guard(self):
+        pr = {"guardmg": {32768: {"decode": 90.0, "prefill": 11000.0}}}
+        ok, problems = bot.check_muse_guard(pr, self.MAIN)
+        self.assertFalse(ok)
+        self.assertIn("muse glimmer decode@32k", problems[0])
+        ok, problems = bot.check_modelopt_guard({"guardmo": {}}, self.MAIN)
+        self.assertFalse(ok)
+        self.assertIn("modelopt guard measurement unavailable", problems)
+        ok, _ = bot.check_modelopt_guard({"guardmo_failed": True, "guardmo": self.MAIN["guardmo"]}, self.MAIN)
+        self.assertFalse(ok)
+
+    def test_flat_numbers_pass_and_qwen36_behaviour_is_unchanged(self):
+        pr = {k: {32768: {m: v * 0.99 for m, v in d[32768].items()}} for k, d in self.MAIN.items()}
+        self.assertEqual(bot.check_modelopt_guard(pr, self.MAIN), (True, []))
+        self.assertEqual(bot.check_muse_guard(pr, self.MAIN), (True, []))
+        self.assertEqual(bot.check_q36_guard(pr, self.MAIN), (True, []))
+        ok, problems = bot.check_q36_guard({"guard36": {}}, self.MAIN)
+        self.assertIn("qwen3.6 guard measurement unavailable", problems)
+
+    def test_comment_says_passed_failed_or_skipped(self):
+        base = {"ok": True, "label": "none", "pr_decode_tps": 1.0, "main_decode_tps": 1.0,
+                "pr_prefill_pp": 1.0, "main_prefill_pp": 1.0, "pr_prefill16k_pp": 1.0,
+                "main_prefill16k_pp": 1.0, "accuracy_ok": True, "q36_guard_ok": True}
+        body = bot.format_comment("c", {**base, "modelopt_guard_ok": True,
+                                        "muse_guard_ok": False, "muse_guard_problems": ["muse glimmer decode@32k: x"],
+                                        "muse_guard_skipped": False})
+        self.assertIn("| modelopt guard | ✅ no regression", body)
+        self.assertIn("| muse glimmer guard | ❌ **FAILED** — muse glimmer decode@32k: x", body)
+        skipped = bot.format_comment("c", {**base, "modelopt_guard_ok": True, "modelopt_guard_skipped": True,
+                                           "muse_guard_ok": True})
+        self.assertIn("| modelopt guard | ⚠️ SKIPPED", skipped)
+        self.assertNotIn("| modelopt guard | ✅", skipped)
+
 if __name__ == "__main__":
     unittest.main()

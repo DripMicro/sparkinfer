@@ -234,9 +234,15 @@ applies `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, derives the generic `eval:*` ti
    and n=128, against a 0.75 bar. Running it would reject every PR. `pr_dspark_bot.py` turned it
    off on the ModelOpt checkpoint for the same reason.
 
-3. **Qwen3.6 no-regression guard** — decode + prefill at ctx 0/512/4k/16k/32k, 0.98 tolerance.
-   Qwen3.8 and Qwen3.6 share `qwen35.cpp`/`inference_engine.cpp`; a regression there is a hard
-   REJECT regardless of Qwen3.8's own result.
+3. **No-regression guards on the other models**, 0.98 tolerance. Each is a hard REJECT regardless
+   of Qwen3.8's own result:
+   - Qwen3.6: decode + prefill at ctx 0/512/4k/16k/32k;
+   - the ModelOpt Qwen3.8 checkpoint and Muse Glimmer: decode + prefill at 32k, the same guards
+     `pr_museglimmer_bot.py` runs.
+
+   The models share `qwen35.cpp`, `inference_engine.cpp` and the packed-decode kernels. The Muse
+   bot skips PRs declared for Qwen3.8 alone, so these guards are the only check such PRs get
+   against Muse Glimmer. A checkpoint missing from the box is skipped and reported as skipped.
 
 **Not evaluated:**
 - PRs whose template declares a different target model (#1027).
