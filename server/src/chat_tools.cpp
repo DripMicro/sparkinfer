@@ -2432,6 +2432,20 @@ PlainAssistantOutput parse_plain_assistant_output(const std::string& raw, bool e
     return out;
 }
 
+std::string context_length_exceeded_error_json(size_t prompt_tokens, int max_tokens, int context_tokens, bool chat) {
+    // Clients decide whether an error is a context overflow by its text, and an agent only compacts
+    // its history and retries the turn when it recognises one. pi (prime-agent) matches a list of
+    // provider wordings; the old "context overflow: prompt=N ... exceeds server ctx=M" matched none,
+    // so a session that grew past the context ended with an error instead of compacting (#1088).
+    const char* what = chat ? "messages" : "prompt";
+    const std::string msg = "This model's maximum context length is " + std::to_string(context_tokens) +
+        " tokens. However, you requested " + std::to_string(prompt_tokens + (size_t)std::max(0, max_tokens)) +
+        " tokens (" + std::to_string(prompt_tokens) + " in the " + what + ", " + std::to_string(max_tokens) +
+        " in the completion). Please reduce the length of the " + what + " or completion.";
+    return json{{"error", {{"message", msg}, {"type", "invalid_request_error"}, {"param", what},
+                           {"code", "context_length_exceeded"}}}}.dump();
+}
+
 bool build_response_format_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
                                    std::string& err) {
     out = ToolCallGrammar{};

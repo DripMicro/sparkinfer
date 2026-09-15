@@ -15,6 +15,7 @@ using nlohmann::json;
 using sparkinfer_server::ChatRequest;
 using sparkinfer_server::ParsedToolOutput;
 using sparkinfer_server::PlainAssistantOutput;
+using sparkinfer_server::context_length_exceeded_error_json;
 using sparkinfer_server::ResponseFormat;
 using sparkinfer_server::ResponseFormatType;
 using sparkinfer_server::ToolChoiceMode;
@@ -1191,6 +1192,22 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_context_length_exceeded_error() {
+    // #1088: pi compacts and retries a turn only on an error it recognises as a context overflow, and
+    // it (like most clients) recognises OpenAI's wording and code, not ours.
+    const json chat = json::parse(context_length_exceeded_error_json(178703, 5777, 131072, true));
+    const std::string msg = chat["error"]["message"].get<std::string>();
+    CHECK(msg.find("maximum context length is 131072 tokens") != std::string::npos);
+    CHECK(msg.find("184480 tokens (178703 in the messages, 5777 in the completion)") != std::string::npos);
+    CHECK(chat["error"]["code"] == "context_length_exceeded");
+    CHECK(chat["error"]["type"] == "invalid_request_error");
+    CHECK(chat["error"]["param"] == "messages");
+    const json text = json::parse(context_length_exceeded_error_json(100, 20, 64, false));
+    CHECK(text["error"]["param"] == "prompt");
+    CHECK(text["error"]["message"].get<std::string>().find("100 in the prompt") != std::string::npos);
+    return true;
+}
+
 bool test_truncated_tool_turn_keeps_reasoning() {
     // #1088: a tool-calling turn that runs out of max_tokens returns its reasoning, not an empty
     // message. The server recovers it with the plain parser, so pin what that parser yields for
@@ -1989,6 +2006,7 @@ int main() {
     if (!test_request_controls_temperature_validation()) return 1;
     if (!test_request_controls_sampling_set_flags()) return 1;
     if (!test_truncated_tool_turn_keeps_reasoning()) return 1;
+    if (!test_context_length_exceeded_error()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;

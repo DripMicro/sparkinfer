@@ -1688,11 +1688,9 @@ int main(int argc, char** argv) {
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
-                     res.set_content(
-                         "{\"error\":{\"message\":\"context overflow: prompt=" +
-                         std::to_string(prompt_ids.size()) + " max_tokens=" + std::to_string(max_tokens) +
-                         " exceeds server ctx=" + std::to_string(engine.max_seq()) + "\"}}",
-                         "application/json");
+                     res.set_content(sparkinfer_server::context_length_exceeded_error_json(
+                                         prompt_ids.size(), max_tokens, engine.max_seq(), /*chat=*/true),
+                                     "application/json");
                      return;
                  }
 
@@ -2799,11 +2797,9 @@ int main(int argc, char** argv) {
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
-                     res.set_content(
-                         "{\"error\":{\"message\":\"context overflow: prompt=" +
-                         std::to_string(prompt_ids.size()) + " max_tokens=" + std::to_string(max_tokens) +
-                         " exceeds server ctx=" + std::to_string(engine.max_seq()) + "\"}}",
-                         "application/json");
+                     res.set_content(sparkinfer_server::context_length_exceeded_error_json(
+                                         prompt_ids.size(), max_tokens, engine.max_seq(), /*chat=*/false),
+                                     "application/json");
                      return;
                  }
 

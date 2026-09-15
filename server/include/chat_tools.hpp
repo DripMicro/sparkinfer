@@ -128,6 +128,11 @@ struct PlainAssistantOutput {
 };
 PlainAssistantOutput parse_plain_assistant_output(const std::string& raw, bool enable_thinking);
 
+// The 400 body for a request whose prompt plus max_tokens does not fit the context: OpenAI's wording,
+// type and code (context_length_exceeded), which agent clients match to compact and retry. `chat`
+// selects "messages" (chat completions) or "prompt" (text completions).
+std::string context_length_exceeded_error_json(size_t prompt_tokens, int max_tokens, int context_tokens, bool chat);
+
 // The opening of a native Qwen tool call that forces one: "<tool_call>\n<function=NAME>\n" for a
 // named function or for tool_choice=required with a single offered function, and
 // "<tool_call>\n<function=" for required with several (the model still writes the name, and can
