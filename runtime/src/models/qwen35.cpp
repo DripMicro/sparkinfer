@@ -706,11 +706,18 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // first wired for. Qwen3.8 is GQA-6 (24 q over 4 kv), matched neither predicate, and has
     // therefore been reading the WHOLE KV cache on every decode step -- 8.59 GB at ctx=262144,
     // which nsys puts at 9.56 ms of a 19.87 ms step (48%) and only 50% of DRAM peak.
-    // SPARKINFER_SPARSE_GQA6=0 restores the dense path for A/B in one binary.
+    //
+    // Opt-in (SPARKINFER_SPARSE_GQA6=1), not the default. The view is an approximation, not a
+    // lossless kernel: from min_ctx on, decode attends the sink and the last 4096 tokens and
+    // nothing in between (#958 said so; its accuracy gate never reached min_ctx). An agent
+    // session passes 16K tokens within a few turns, and from there Qwen3.8 could not read back:
+    // pi read a 31K-token tool result and described it as a column of integers, and a line
+    // 20K tokens back was reported absent (#1088). Exact attention costs decode throughput at
+    // long context (95 -> 85.7 tok/s at ctx=32768 in #958); that is the price of the answer.
     const int gqa_ratio = cfg.n_kv_heads > 0 ? cfg.n_q_heads / cfg.n_kv_heads : 0;
     static const bool sparse_gqa6_on = [] {
         const char* e = getenv("SPARKINFER_SPARSE_GQA6");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     const bool sparse_gqa6 = sparse_gqa6_on && cfg.head_dim == 256 && cfg.n_kv_heads > 0 &&
                              cfg.n_q_heads == cfg.n_kv_heads * 6;
