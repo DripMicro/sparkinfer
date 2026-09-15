@@ -3858,7 +3858,15 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     s.dflash_ctx_len = 0;
     s.dflash_ctx_start = std::max(0, std::min(context_start, s.cfg.max_seq));
     invalidate_decode_graph();
-    if (!on) return;
+    if (!on) {
+        // The buffers go with the capture. They are sized for one generation -- ~0.5 GB for a
+        // 20K-token prompt -- and were held until the NEXT speculative run, which left that much
+        // less for every other request's prefill scratch and session state: concurrent 20K-token
+        // requests on serve-dspark at --ctx 131072 ran out of device memory (#1088).
+        if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
+        if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
+        return;
+    }
     const int H = s.cfg.hidden;
     const size_t row_elems = (size_t)s.dflash_n_cap * H;
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);

@@ -1093,8 +1093,13 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
         return out;
     }
 
+    // Only an error that kills the context fails a request the engine completed.
+    // cudaGetLastError returns the last error ANY call raised, and an allocation failure another
+    // path already handled -- a prefill scratch arena falling back to windows, another request's
+    // session refused -- is not this request's: it turned 117 finished requests into
+    // "cuda error after decode: out of memory" under concurrent long prompts (#1088).
     cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
+    if (sparkinfer::is_unrecoverable(e)) {
         out.error = std::string("cuda error after decode: ") + cudaGetErrorString(e);
         fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());
         return out;
