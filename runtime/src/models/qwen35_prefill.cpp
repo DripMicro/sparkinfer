@@ -3288,6 +3288,39 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     float* nv_ps_a = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
     signed char* nv_pq_b = a.alloc<signed char>((size_t)NA * nv_pwide);
     float* nv_ps_b = a.alloc<float>((size_t)NA * (nv_pwide / 16) + 1);
+    // WIDE-BATCH CHECKPOINT-FP8 PROJECTIONS. A checkpoint that ships the Gated-DeltaNet projections
+    // as FP8 runs them below as row-GEMVs, which are compute-bound: every row redoes the whole
+    // dot product, so a projection costs the same per row at 32 rows as at one. Past eight rows,
+    // run them on the FP8 tensor cores instead -- the same GEMM batched prefill already runs on
+    // these weights (per-row dynamic e4m3 activation against the checkpoint's own e4m3 rows and
+    // per-channel scales), whose cost is flat in the row count. DSpark's verify never reaches these
+    // widths. SPARKINFER_FP8_PACKED_GEMM_MIN_ROWS sets the threshold; 0 disables the arm.
+    static const int kFp8GemmMinRows = [] {
+        const char* e = getenv("SPARKINFER_FP8_PACKED_GEMM_MIN_ROWS");
+        return e ? atoi(e) : 9;
+    }();
+    const bool fp8_ckpt = [&] {
+        for (int L = 0; L < c.n_layers; ++L)
+            if (s.w.layers[L].linear_attn) return s.w.layers[L].wqkv_type == kernels::SI_QTYPE_FP8;
+        return false;
+    }();
+    // Two of each: the staged activation alternates so a later stage cannot overwrite one a side
+    // stream is still reading, and the weight scales / split-K partials are per stream.
+    signed char* f8_a[2] = {nullptr, nullptr};
+    float* f8_sx[2] = {nullptr, nullptr};
+    float* f8_sw[2] = {nullptr, nullptr};
+    float* f8_p[2] = {nullptr, nullptr};
+    if (packed && fp8_ckpt && kFp8GemmMinRows > 0) {
+        const int f8_kwide = std::max(H, lvdim);
+        const int f8_nwide = std::max(std::max(lqkv, lvdim), H);
+        for (int i = 0; i < 2; ++i) {
+            f8_a[i] = a.alloc<signed char>((size_t)NA * f8_kwide);
+            f8_sx[i] = a.alloc<float>(NA);
+            f8_sw[i] = a.alloc<float>(f8_nwide);
+            f8_p[i] = a.alloc<float>((size_t)NA * f8_nwide);
+        }
+    }
+    const bool fp8_gemm = f8_p[1] && N >= kFp8GemmMinRows;
     // WIDE-BATCH FFN OPERANDS. Above a handful of rows the row-GEMV stops being the right kernel:
     // it reads the weights once per chunk of 8, while a block-scaled GEMM reads them once for the
     // whole batch. Measured per decode forward on RTX 5090 at the real FFN shapes, the crossover
@@ -3644,10 +3677,41 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             nvq_src_a = in; nvq_k_a = k; nvq_use_b = false;
         }
     };
+    // Per-row e4m3 staging for the FP8 GEMM arm, keyed on the source buffer like the caches above.
+    // `prefork` marks a stage issued before a side-stream fork; only those may be read off `st`.
+    const bf16* f8_src[2] = {nullptr, nullptr};
+    int f8_k[2] = {0, 0};
+    bool f8_prefork[2] = {false, false};
+    int f8_next = 0;
+    auto fp8_stage = [&](const bf16* in, int k, bool prefork) -> int {
+        for (int i = 0; i < 2; ++i)
+            if (f8_src[i] == in && f8_k[i] == k) { f8_prefork[i] = f8_prefork[i] || prefork; return i; }
+        const int i = f8_next;
+        f8_next ^= 1;
+        kernels::launch_prefill_quantize_rows_fp8(in, f8_a[i], f8_sx[i], N, k, st);
+        f8_src[i] = in; f8_k[i] = k; f8_prefork[i] = prefork;
+        return i;
+    };
+    auto fp8_gemm_on = [&](cudaStream_t ps, const bf16* in, const void* w, bf16* out, int no,
+                           int k) -> bool {
+        if (!fp8_gemm || no < 128) return false;
+        int ai = -1;
+        for (int i = 0; i < 2; ++i) if (f8_src[i] == in && f8_k[i] == k) ai = i;
+        if (ps != st && (ai < 0 || !f8_prefork[ai])) return false;
+        if (ai < 0) ai = fp8_stage(in, k, false);
+        const int slot = (ps == st) ? 0 : 1;
+        kernels::launch_prefill_fp8_wscales_bf16(w, f8_sw[slot], no, ps);
+        const void* we4 = static_cast<const char*>(w) + (size_t)no * 2;
+        if (!kernels::launch_prefill_gemm_fp8_splitk(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out,
+                                                     N, no, k, f8_p[slot], ps))
+            kernels::launch_prefill_gemm_fp8(f8_a[ai], we4, f8_sx[ai], f8_sw[slot], out, N, no, k, ps);
+        return true;
+    };
     auto proj = [&](const bf16* in, const void* w, int type, bf16* out, int no, int k) -> bool {
         if (type == 0) {
             return kernels::launch_gemv_rows(in, w, out, N, no, k, st);
         }
+        if (type == kernels::SI_QTYPE_FP8 && fp8_gemm_on(st, in, w, out, no, k)) return true;
         // SI_QTYPE_FP8: the GDN projections have been checkpoint-native FP8 since #832 ("native
         // FP8 GDN GEMV"), which this verifier predates -- it only knew bf16/Q8_0/Q4_K/Q6_K, so a
         // Qwen3.8 verify died here after clearing the dense-FFN stage.
@@ -3771,6 +3835,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     auto proj_on = [&](cudaStream_t ps, const bf16* in, const void* w, int type, bf16* out,
                        int no, int k) -> bool {
         if (type == 0) return kernels::launch_gemv_rows(in, w, out, N, no, k, ps);
+        if (type == kernels::SI_QTYPE_FP8 && fp8_gemm_on(ps, in, w, out, no, k)) return true;
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
         if (type == kernels::SI_QTYPE_FP8 || type == kernels::SI_QTYPE_NVFP4) {
@@ -3957,6 +4022,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // emits a fresh Q8_1(xn); nothing re-stamps this one, so clear it here.
         nvq_src_a = nullptr; nvq_k_a = 0;
         nvq_src_b = nullptr; nvq_k_b = 0;
+        f8_src[0] = f8_src[1] = nullptr; f8_prefork[0] = f8_prefork[1] = false;
         // ...except an entry the PREVIOUS layer's tail norm emitted itself. That one IS this
         // layer's xn, written by the kernel that produced xn, so it is fresh by construction --
         // the staleness this reset exists for is a pointer-keyed hit on a buffer some EARLIER
@@ -4204,6 +4270,8 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                  w.wqkv_gate_type == kernels::SI_QTYPE_NVFP4 ||
                  w.ssm_alpha_type == kernels::SI_QTYPE_NVFP4 ||
                  w.ssm_beta_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
+            if (fp8_gemm && (w.wqkv_type == kernels::SI_QTYPE_FP8 ||
+                             w.wqkv_gate_type == kernels::SI_QTYPE_FP8)) fp8_stage(xn, H, true);
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
             const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                      w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
