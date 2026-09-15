@@ -3950,7 +3950,7 @@ constexpr int SI_AM_BN = 32, SI_AM_MMAX = 32, SI_AM_NW = 4;
 // 1.3 per SM on 170 SMs while the kernel fits 8 -- the GRID, not the tile, was the limit here.
 constexpr int SI_AM_SK_DEF = 8;
 // Split-K needs an fp32 accumulator that survives across blocks, and y is bf16 and the caller's.
-// Own one: 32 x 6656 floats is 852 KB per slot, which covers every width the dispatch gates to.
+// Own one: SI_AM_MMAX x SI_AM_NACC floats per slot, which covers every width the dispatch gates to.
 // The epilogue re-zeroes what it consumed, so no call needs a memset of its own.
 //
 // A slot per stream, because decode is not single-stream: the K/V-side projections and the GDN
@@ -3961,8 +3961,13 @@ constexpr int SI_AM_SK_DEF = 8;
 // Static, and deliberately not allocated on demand: decode captures CUDA graphs, and a cudaMalloc
 // reached during capture invalidates the graph -- which surfaces as "verify graph launch: invalid
 // argument" and a step that returns without doing the work.
+//
+// SI_AM_NACC is the widest projection a packed step hands this arm: Qwen3.8's 12288-row q|gate. At
+// 6656 -- Muse Glimmer's widest -- a 32-row q|gate overflowed the slot and had to be split into two
+// 16-row launches, each re-reading the whole 35 MB weight. 32 x 12288 floats is 1.5 MB a slot.
+constexpr int SI_AM_NACC = 12288;
 constexpr int SI_AM_SLOTS = 4;
-__device__ float si_am_acc[SI_AM_SLOTS][SI_AM_MMAX * 6656];
+__device__ float si_am_acc[SI_AM_SLOTS][SI_AM_MMAX * SI_AM_NACC];
 
 __device__ __forceinline__ int si_am_swz(int k, int row) {
     return (((k >> 4) ^ (row & 3)) << 4) | (k & 15);
@@ -4216,6 +4221,18 @@ static inline int si_am_bdedup() {
     return on;
 }
 
+// Floats one launch may accumulate: the whole slot by default. SPARKINFER_MMVQ_MMA_NACC=6656 restores
+// the previous slot width, so both arms of an A/B come out of ONE binary.
+static inline size_t si_am_cap() {
+    static const size_t cap = [] {
+        const char* e = getenv("SPARKINFER_MMVQ_MMA_NACC");
+        long v = e ? atol(e) : (long)SI_AM_NACC;
+        if (v < 32 || v > SI_AM_NACC) v = SI_AM_NACC;
+        return (size_t)SI_AM_MMAX * (size_t)v;
+    }();
+    return cap;
+}
+
 static inline int si_am_astage(int M) {
     static const int on = [] {
         const char* e = getenv("SPARKINFER_MMA_ASTAGE");
@@ -4228,7 +4245,7 @@ static inline int si_am_astage(int M) {
 static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void* y,
                                             int M, int N, int K, cudaStream_t stream) {
     if (M < 2 || M > SI_AM_MMAX || (K & 255) || (N % SI_AM_BN)) return false;
-    if ((size_t)M * (size_t)N > (size_t)SI_AM_MMAX * 6656u) return false;
+    if ((size_t)M * (size_t)N > si_am_cap()) return false;
     static int sk = -1;
     if (sk < 0) { const char* e = getenv("SPARKINFER_MMVQ_MMA_SPLITK"); sk = e ? atoi(e) : SI_AM_SK_DEF; }
     int nsk = sk; const int nblk = K >> 8;
@@ -4256,7 +4273,7 @@ static inline bool launch_mmvq_q4k_mma_rows(const void* q81, const void* W, void
     if (slot < 0) return false;
     float* acc = nullptr;
     if (cudaGetSymbolAddress(reinterpret_cast<void**>(&acc), si_am_acc) != cudaSuccess) return false;
-    acc += (size_t)slot * SI_AM_MMAX * 6656u;
+    acc += (size_t)slot * (size_t)SI_AM_MMAX * (size_t)SI_AM_NACC;
     {
         const dim3 gk(N / SI_AM_BN, nsk), bk(SI_AM_NW * 32);
         const si_block_q8_1* qa = reinterpret_cast<const si_block_q8_1*>(q81);
@@ -4450,10 +4467,15 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
     // N is the block count: at N=32 per block, k and v (N=256 on this checkpoint) would launch
     // eight blocks onto 170 SMs and the per-launch cost swamps the saved weight reads. Only the
     // wide projections -- q and the attention output -- have enough work to fill the device.
+    // 1024, not 2048: a 1024-row projection is 32 blocks, and with the K split below that is 256 --
+    // enough to fill the device at packed widths. Qwen3.8's compressed-tensors checkpoint loads its
+    // attention k and v (4 kv heads x 256) as Q4_K, and at 16-32 rows they were paying 4-8 chunked
+    // MMVQ launches each per layer: measured on the continuous-batch step, c16 782.6 -> 804.6 and
+    // c32 1112.2 -> 1150.7 tok/s. The 256-row k/v the note above describes stays below the floor.
     static int mmvq_mma_minn = -1;
     if (mmvq_mma_minn < 0) {
         const char* e = getenv("SPARKINFER_MMVQ_MMA_MINN");
-        mmvq_mma_minn = e ? atoi(e) : 2048;
+        mmvq_mma_minn = e ? atoi(e) : 1024;
     }
     // Eight rows, because the floor is about weight traffic rather than arithmetic: the chunked
     // MMVQ below reads the weights once per eight rows, so at or under eight it already reads them
@@ -4463,8 +4485,31 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
         const char* e = getenv("SPARKINFER_MMVQ_MMA_MINM");
         mmvq_mma_minm = e ? atoi(e) : 8;
     }
-    if (mmvq_mma && M >= mmvq_mma_minm && qtype == 12 && N >= mmvq_mma_minn &&
-        launch_mmvq_q4k_mma_rows(q81, W, y, M, N, K, stream)) return true;
+    if (mmvq_mma && M >= mmvq_mma_minm && qtype == 12 && N >= mmvq_mma_minn) {
+        if (launch_mmvq_q4k_mma_rows(q81, W, y, M, N, K, stream)) return true;
+        // A batch whose M*N outgrows the split-K accumulator slot (see SI_AM_NACC) used to
+        // drop all the way to the eight-row MMVQ chunks below -- four launches per layer for a 12288-
+        // row q|gate at 32 rows. Chunk at the widest width that still fits instead; each chunk is
+        // the same tensor-core kernel over its own rows. SPARKINFER_MMVQ_MMA_CHUNK=0 restores the
+        // eight-row fallback.
+        static const bool mma_chunk = [] {
+            const char* e = getenv("SPARKINFER_MMVQ_MMA_CHUNK");
+            return !(e && e[0] == '0');
+        }();
+        const int mc = (int)(si_am_cap() / (size_t)N) & ~7;
+        if (mma_chunk && (size_t)M * (size_t)N > si_am_cap() &&
+            mc >= mmvq_mma_minm && mc < M && !(K & 255) && !(N % SI_AM_BN)) {
+            for (int r0 = 0; r0 < M; r0 += mc) {
+                const int m = (M - r0) < mc ? (M - r0) : mc;
+                if (!launch_mmvq_rows(qtype,
+                                      reinterpret_cast<const si_block_q8_1*>(q81)
+                                          + (size_t)r0 * (size_t)(K >> 5),
+                                      W, reinterpret_cast<__nv_bfloat16*>(y) + (size_t)r0 * N,
+                                      m, N, K, stream)) return false;
+            }
+            return true;
+        }
+    }
     if (M > 8) {
         for (int r0 = 0; r0 < M; r0 += 8) {
             const int m = (M - r0) < 8 ? (M - r0) : 8;
