@@ -50,15 +50,18 @@ after this bot's first live run wrongly auto-closed an unrelated PR (#768, reope
 apologized); the user was told the risk directly and chose to accept it rather than narrow the
 evaluation scope.
 
-  3. Cross-model no-regression guards @ 32k — decode + prefill on TWO models, same box, same PR
+  3. Cross-model no-regression guards @ 32k — decode + prefill on THREE models, same box, same PR
               build, vs a freshly-measured origin/main:
                 * Qwen3.6-35B-A3B (Q36_GUARD_*), and
                 * the ModelOpt Qwen3.8-27B NVFP4 checkpoint (MODELOPT_MODEL_DIR) -- the one
                   pr_dspark_bot.py scores, so a shared-code regression is caught here at Muse-PR
-                  time instead of surfacing later as a mystery in that bot's numbers.
+                  time instead of surfacing later as a mystery in that bot's numbers, and
+                * the unsloth Qwen3.8-27B NVFP4 checkpoint (QWEN38_MODEL_DIR) -- the one
+                  pr_qwen38_bot.py scores (added 2026-09-15). That bot skips PRs declared for
+                  Muse Glimmer alone, so without this guard nothing checked them against it.
               Narrowed from the previous five-context Qwen3.6 sweep to 32k only: those extra
               points cost a model load each on models this bot does not score, and 32k is where
-              shared prefill/KV code actually breaks. Both guards share one implementation
+              shared prefill/KV code actually breaks. All three guards share one implementation
               (_check_model_guard) so they cannot drift apart. Reuses pr_dflash_bot.py's GUARD36
               sweep mechanism (bench_sweep_run, REGRESS_TOL=0.98) rather than reinventing it.
               A regression here is a hard REJECT regardless of Muse Glimmer's own speed/accuracy
@@ -132,7 +135,8 @@ MUSEGLIMMER_NEEDS_REBASE = "museglimmer-needs-rebase"
 # 128/512/4k/16k/32k, Qwen3.6 guard narrowed to 32k, ModelOpt Qwen3.8 32k guard added. A PR
 # scored under v3 must not keep a two-dimension label forever, so the version changes and every
 # open PR is re-evaluated.
-EVAL_SCHEMA_VERSION = "v5-ctx6-prefill-decode-cbdecode-modelopt-guard"
+# v6 (2026-09-15): unsloth Qwen3.8 32k guard added beside the ModelOpt and Qwen3.6 guards.
+EVAL_SCHEMA_VERSION = "v6-ctx6-prefill-decode-cbdecode-modelopt-unsloth-guards"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-museglimmer-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -318,6 +322,12 @@ MODELOPT_GUARD_CTXS = [32768]
 # this bot before it lands, rather than showing up later as a mystery regression in the DSpark
 # bot's own numbers. Same env var name as that bot uses, so one .env.eval entry serves both.
 MODELOPT_GUARD_MODEL_DIR = os.environ.get("MODELOPT_MODEL_DIR", "/root/workspace/models_q38_modelopt")
+# The unsloth Qwen3.8-27B NVFP4 checkpoint (NVFP4 FFN + FP8 attention/Gated-DeltaNet projections) --
+# the one pr_qwen38_bot.py scores. Its FP8 and Q4_K code paths are not the ModelOpt checkpoint's, so
+# the ModelOpt guard above does not cover it. pr_qwen38_bot.py skips PRs declared for Muse Glimmer
+# alone, so this guard is the only check they get against it. Same env var as that bot uses.
+UNSLOTH_GUARD_MODEL_DIR = os.environ.get("QWEN38_MODEL_DIR", "/root/workspace/models_qwen38")
+UNSLOTH_GUARD_CTXS = [32768]
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
@@ -463,6 +473,12 @@ def check_modelopt_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     the Qwen3.6 guard and the same hard-REJECT consequence -- this is the checkpoint the DSpark
     bot scores, so a Muse PR that regresses it via shared code must not land."""
     return _check_model_guard(pr, main, "guardmo", "modelopt", tol)
+
+
+def check_unsloth_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Unsloth Qwen3.8-27B NVFP4 no-regression guard, decode + prefill @ 32k. Same discipline and the
+    same hard REJECT as the ModelOpt guard -- this is the checkpoint pr_qwen38_bot.py scores."""
+    return _check_model_guard(pr, main, "guardun", "unsloth qwen3.8", tol)
 
 
 def museglimmer_evaluated_commits(repo, num):
@@ -707,6 +723,9 @@ def _remote_script(ref: str) -> str:
     q36_ctx_list = " ".join(str(c) for c in Q36_GUARD_CTXS)
     mo_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in MODELOPT_GUARD_CTXS)
     mo_ctx_list = " ".join(str(c) for c in MODELOPT_GUARD_CTXS)
+    un_dir = shlex.quote(UNSLOTH_GUARD_MODEL_DIR)
+    un_sweep_args = " ".join(f"{c} {BENCH_REPS}" for c in UNSLOTH_GUARD_CTXS)
+    un_ctx_list = " ".join(str(c) for c in UNSLOTH_GUARD_CTXS)
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently — same diagnostic trap as
@@ -757,6 +776,7 @@ Q36_GUARD_MODEL_FILE={q36_file}
 Q36_GUARD_MODEL_REPO={q36_repo}
 Q36_GUARD_TOK_REPO={q36_tok}
 MODELOPT_GUARD_MODEL_DIR={mo_dir}
+UNSLOTH_GUARD_MODEL_DIR={un_dir}
 
 cd "$REPO"
 git remote set-url origin https://github.com/gittensor-ai-lab/sparkinfer.git 2>/dev/null || true
@@ -1003,6 +1023,22 @@ if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
 else
   echo "GUARDMO_UNAVAILABLE"
 fi
+
+# --- Unsloth Qwen3.8-27B NVFP4 no-regression guard (decode + prefill @ 32k) ---
+# The checkpoint pr_qwen38_bot.py scores, run the way that bot runs it (no env pins). Skipped, not
+# failed, when the checkpoint is absent, exactly like the ModelOpt guard above.
+if [ -d "$UNSLOTH_GUARD_MODEL_DIR" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$UNSLOTH_GUARD_MODEL_DIR" 128 {un_sweep_args}; then
+    for ctx in {un_ctx_list}; do
+      echo "GUARDUN $ctx $(_bench_sweep_get $ctx decode_tps) $(_bench_sweep_get $ctx prefill_pp)"
+    done
+  else
+    echo "GUARDUN_FAILED"
+  fi
+else
+  echo "GUARDUN_UNAVAILABLE"
+fi
 echo "GUARD_END"
 """
 
@@ -1034,6 +1070,7 @@ def _parse_remote(stdout: str) -> dict:
     out = {}
     guard36 = {}
     guardmo = {}
+    guardun = {}
     muse = {}
     muse_cb = {}
     cb_failed = set()
@@ -1118,8 +1155,20 @@ def _parse_remote(stdout: str) -> dict:
             out["guardmo_failed"] = True
         elif line.strip() == "GUARDMO_UNAVAILABLE":
             out["guardmo_unavailable"] = True
+        elif line.startswith("GUARDUN "):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    guardun[int(parts[1])] = {"decode": float(parts[2]), "prefill": float(parts[3])}
+                except ValueError:
+                    pass
+        elif line.strip() == "GUARDUN_FAILED":
+            out["guardun_failed"] = True
+        elif line.strip() == "GUARDUN_UNAVAILABLE":
+            out["guardun_unavailable"] = True
     out["guard36"] = guard36
     out["guardmo"] = guardmo
+    out["guardun"] = guardun
     out["muse"] = muse
     out["muse_cb"] = muse_cb
     out["cb_failed"] = sorted(cb_failed)
@@ -1424,6 +1473,17 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         label = "REJECT"
         passed = False
 
+    un_ok, un_problems = check_unsloth_guard(pr, main)
+    if pr.get("guardun_unavailable") or main.get("guardun_unavailable"):
+        # Same SKIP-not-REJECT handling as the ModelOpt guard, and the same announcement.
+        un_ok, un_problems = True, []
+        print(">> unsloth qwen3.8 guard SKIPPED — checkpoint not installed (QWEN38_MODEL_DIR)")
+    if not un_ok:
+        un_reason = "unsloth qwen3.8 no-regression guard failed: " + "; ".join(un_problems[:6])
+        reason = f"{un_reason} | {reason}"
+        label = "REJECT"
+        passed = False
+
     q36_ok, q36_problems = check_q36_guard(pr, main)
     if not q36_ok:
         # Same hard-REJECT discipline as the accuracy gate: a Muse Glimmer PR that silently
@@ -1463,6 +1523,9 @@ def eval_museglimmer_on_box(host, port, pr_ref: str, main: dict):
         "cb_pr": (pr.get("muse_cb") or {}),
         "cb_main": (main.get("muse_cb") or {}),
         "guardmo_skipped": bool(pr.get("guardmo_unavailable") or main.get("guardmo_unavailable")),
+        "unsloth_guard_ok": un_ok,
+        "unsloth_guard_problems": un_problems,
+        "guardun_skipped": bool(pr.get("guardun_unavailable") or main.get("guardun_unavailable")),
         "pr_top1": pr_top1,
         "pr_kl": pr_kl,
         "pr_ppl_spark": pr.get("ppl_spark"),
@@ -1558,6 +1621,8 @@ def format_comment(commit: str, res: dict) -> str:
         "q36_guard_ok": res.get("q36_guard_ok"),
         "modelopt_guard_ok": res.get("modelopt_guard_ok"),
         "modelopt_guard_skipped": res.get("guardmo_skipped"),
+        "unsloth_guard_ok": res.get("unsloth_guard_ok"),
+        "unsloth_guard_skipped": res.get("guardun_skipped"),
         # WHICH axis produced delta_pct. Necessary now that the tier comes from ten axes while the
         # marker still carries only the 128 numbers for the dashboard: without this a reader sees
         # a headline delta that does not match either number next to it (e.g. +3900% from
@@ -1608,6 +1673,15 @@ def format_comment(commit: str, res: dict) -> str:
         mo_problems = "; ".join((res.get("modelopt_guard_problems") or [])[:4])
         mo_row = (f"| modelopt guard | ❌ **FAILED** — {mo_problems} — "
                   "**verdict forced to REJECT regardless of speed/accuracy** |\n")
+    if res.get("guardun_skipped"):
+        un_row = ("| unsloth qwen3.8 guard | ⚠️ SKIPPED — checkpoint not installed on the box "
+                  "(`QWEN38_MODEL_DIR`); shared-code regressions on it were NOT checked |\n")
+    elif res.get("unsloth_guard_ok"):
+        un_row = "| unsloth qwen3.8 guard | ✅ no regression (decode+prefill @ 32k, unsloth Qwen3.8-27B NVFP4) |\n"
+    else:
+        un_problems = "; ".join((res.get("unsloth_guard_problems") or [])[:4])
+        un_row = (f"| unsloth qwen3.8 guard | ❌ **FAILED** — {un_problems} — "
+                  "**verdict forced to REJECT regardless of speed/accuracy** |\n")
     polaris = res.get("polaris") or {}
     receipt = polaris.get("receipt")
     if receipt:
@@ -1629,6 +1703,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"{main_acc_note}"
         f"{q36_row}"
         f"{mo_row}"
+        f"{un_row}"
         f"| PPL sparkinfer / llama.cpp | {res.get('pr_ppl_spark') or '?'} / {res.get('pr_ppl_llama') or '?'} |\n"
         f"{polaris_row}"
         f"| commit | `{commit[:9]}` |\n\n"
@@ -1778,6 +1853,8 @@ def upload_museglimmer_eval_log(repo, num, title, oid, res):
             "pr_top1": res.get("pr_top1"), "pr_kl": res.get("pr_kl"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"), "q36_guard_problems": res.get("q36_guard_problems"),
+            "modelopt_guard_ok": res.get("modelopt_guard_ok"), "unsloth_guard_ok": res.get("unsloth_guard_ok"),
+            "unsloth_guard_problems": res.get("unsloth_guard_problems"),
             "gpu": "pinned eval box", "date": arb.datetime.date.today().isoformat(),
         }
         if receipt:
@@ -1871,6 +1948,7 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             "pass": res.get("pass"),
             "accuracy_ok": res.get("accuracy_ok"),
             "q36_guard_ok": res.get("q36_guard_ok"),
+            "unsloth_guard_ok": res.get("unsloth_guard_ok"),
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         _save_scores(scores)
@@ -1895,6 +1973,10 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
         if label in ("REJECT", "none"):
             if not res.get("q36_guard_ok", True):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
+            elif not res.get("modelopt_guard_ok", True):
+                fail_clause = "and regressed the ModelOpt Qwen3.8 no-regression guard (decode/prefill @ 32k)"
+            elif not res.get("unsloth_guard_ok", True):
+                fail_clause = "and regressed the unsloth Qwen3.8 no-regression guard (decode/prefill @ 32k)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
             elif res.get("prefill_regressed"):

@@ -65,8 +65,10 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               inference_engine.cpp, and that shared surface is exactly how PR #775 regressed a
               model nobody was scoring at the time.
 
-  3b. ModelOpt Qwen3.8 and Muse Glimmer no-regression guards — decode + prefill at 32k each, the
-              same pair pr_museglimmer_bot.py guards, with the same hard REJECT. The Muse bot skips
+  3b. ModelOpt Qwen3.8 and Muse Glimmer no-regression guards — decode + prefill at 32k and
+              concurrent decode at c16/c32 on each, with the same hard REJECT. The 32k guards are
+              the pair pr_museglimmer_bot.py runs; the concurrency guards cover the packed decode
+              this bot's PRs mostly change, which no single-stream guard enters. The Muse bot skips
               PRs declared for Qwen3.8 alone (since #1082), so this bot is the only check those PRs
               get against either model. A checkpoint missing from the box is skipped and reported,
               never rejected.
@@ -192,7 +194,8 @@ QWEN38_NEEDS_REBASE = "qwen38-needs-rebase"
 # a scoring change existed must not keep a stale-scored label/score forever.
 # v2 (2026-09-15): concurrent-decode axes added (issue #1080), and the harness is taken from main.
 # v3 (2026-09-15): ModelOpt Qwen3.8 and Muse Glimmer no-regression guards added.
-EVAL_SCHEMA_VERSION = "v3-unsloth-concurrency-cross-model-guards"
+# v4 (2026-09-15): those guards also cover concurrent decode at c16/c32.
+EVAL_SCHEMA_VERSION = "v4-unsloth-concurrency-cross-model-guards-cb"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -254,6 +257,18 @@ MUSE_GUARD_GGUF = os.environ.get(
 MUSE_GUARD_CTXS = [32768]
 # reps=5 (median), as for the Qwen3.6 guard: a guard that hard-REJECTs must not act on one sample.
 GUARD_REPS = 5
+# Concurrent-decode guards on the same two checkpoints. The 32k guards above run ONE request, but
+# the PRs this bot scores mostly change the packed multi-row decode step, which a single request
+# never enters -- so a PR could slow ModelOpt or Muse Glimmer under concurrency and pass every
+# single-stream guard. Each width is the median of CB_REPS complete runs through cb_median, the same
+# function the scored ladder uses, and each model is run the way its own bot runs it.
+#
+# Measured on main 9171513, two sessions of three runs, medians: ModelOpt c16 1078.3 / 1078.9 and
+# c32 ~1598 / 1589.7; Muse Glimmer c16 1006.9 / 1005.6 and c32 1189.2 / 1181.3 tok/s. Spread 0.06-0.67%,
+# far inside the -2% reject band. No request failed to open; one ModelOpt c32 run stopped part-way
+# (7,970 of 8,200 tokens), which cb_complete rejects and re-runs. 8-12 s a run, so the four guards
+# add about two minutes per ref.
+CB_GUARD_CONCS = [16, 32]
 
 # Auto-merge is wired (mirrors pr_dflash_bot.py's auto_merge_ok_dflash/try_auto_merge_dflash
 # shape) but OFF unless this exact env var is set — NOT set in .env.eval, so it stays fully
@@ -375,7 +390,8 @@ def _cb_table(res: dict) -> str:
             "|---|--:|--:|--:|--:|\n" + "\n".join(rows) + "\n\n")
 
 
-def _check_model_guard(pr: dict, main: dict, key: str, model: str, tol: float = REGRESS_TOL):
+def _check_model_guard(pr: dict, main: dict, key: str, model: str, tol: float = REGRESS_TOL,
+                       metrics=("decode", "prefill"), label_for=None):
     """No-regression check for ONE guarded model: PR vs same-box main, decode + prefill, every
     measured context. `key` is the _parse_remote dict key holding that model's per-context numbers
     and `model` its display name, so every guard is the SAME code -- the pr_museglimmer_bot.py
@@ -389,9 +405,9 @@ def _check_model_guard(pr: dict, main: dict, key: str, model: str, tol: float = 
     # its own sweep must not make that context silently uncheckable. Fail closed: a real main
     # baseline (base > 0) with a missing/zero PR measurement (cur <= 0) is a regression, not a skip.
     for ctx, main_vals in main_ctxs.items():
-        label = GUARD_CTX_LABEL.get(ctx, str(ctx))
+        label = label_for(ctx) if label_for else GUARD_CTX_LABEL.get(ctx, str(ctx))
         pr_vals = pr_ctxs.get(ctx) or {}
-        for metric in ("decode", "prefill"):
+        for metric in metrics:
             base = main_vals.get(metric, 0)
             if base <= 0:
                 continue  # main itself has no baseline for this metric/ctx — not comparable
@@ -424,6 +440,18 @@ def check_modelopt_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
 def check_muse_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
     """Muse Glimmer 30B no-regression guard (pt. 3b), decode + prefill @ 32k."""
     return _check_model_guard(pr, main, "guardmg", "muse glimmer", tol)
+
+
+def check_modelopt_cb_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """ModelOpt concurrent-decode no-regression guard (pt. 3b), aggregate tok/s at CB_GUARD_CONCS."""
+    return _check_model_guard(pr, main, "guardcbmo", "modelopt concurrent", tol,
+                              metrics=("cb-decode",), label_for=lambda c: f"c{c}")
+
+
+def check_muse_cb_guard(pr: dict, main: dict, tol: float = REGRESS_TOL):
+    """Muse Glimmer concurrent-decode no-regression guard (pt. 3b), aggregate tok/s at CB_GUARD_CONCS."""
+    return _check_model_guard(pr, main, "guardcbmg", "muse glimmer concurrent", tol,
+                              metrics=("cb-decode",), label_for=lambda c: f"c{c}")
 
 
 def qwen38_evaluated_commits(repo, num):
@@ -659,6 +687,7 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     mo_ctx_list = " ".join(str(c) for c in MODELOPT_GUARD_CTXS)
     mg_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in MUSE_GUARD_CTXS)
     mg_ctx_list = " ".join(str(c) for c in MUSE_GUARD_CTXS)
+    cb_guard_concs = " ".join(str(c) for c in CB_GUARD_CONCS)
     return f"""
 set -euo pipefail
 # Surface *why* a crash happened instead of dying silently -- same diagnostic trap as the sibling
@@ -839,49 +868,56 @@ cb_complete() {{
   return 1
 }}
 
-for CC in {cb_concs}; do
-  CB_OUT=/tmp/q38_cb_$CC.txt
-  CB_AGGS=""; CB_ITLS=""; CB_VALID=0; ATTEMPT=0
-  while [ "$CB_VALID" -lt {cb_reps} ]; do
-    ATTEMPT=$((ATTEMPT + 1))
-    if [ "$ATTEMPT" -gt {cb_max_attempts} ]; then
-      echo "RETRYABLE_INFRA_FAILURE concurrent decode at c=$CC stopped requests part-way on $((ATTEMPT - 1 - CB_VALID)) of {cb_max_attempts} runs" >&2
-      exit 75
+# cb_median CHECKPOINT C [ENV=VALUE ...]: aggregate tok/s with C requests in flight, the median of
+# {cb_reps} complete runs (cb_complete). Sets CB_AGG, CB_ITL, CB_TOK, CB_ERR and CB_AGGS (the runs).
+# Returns 1, with the reason on stderr, when the harness exits nonzero, measures nothing, or stops
+# requests part-way on too many runs. The caller decides what that means: the scored ladder fails
+# the round, a guard fails closed.
+cb_median() {{
+  local ckpt=$1 cc=$2 out=/tmp/q38_cb.txt attempt=0 valid=0 a i
+  shift 2
+  CB_AGGS=""; CB_ITLS=""; CB_AGG=0; CB_ITL=0; CB_TOK=0; CB_ERR=0
+  while [ "$valid" -lt {cb_reps} ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt {cb_max_attempts} ]; then
+      echo "concurrent decode at c=$cc on $ckpt stopped requests part-way on $((attempt - 1 - valid)) of {cb_max_attempts} runs" >&2
+      return 1
     fi
     wait_gpu_clear
-    if ! timeout 900 env \
-      SPARKINFER_QWEN38_PREFILL_NVFP4=1 \
-      SPARKINFER_QWEN38_DECODE_NVFP4=1 \
-      SPARKINFER_KV_INT8=1 \
-      build/runtime/qwen3_gguf_cb_bench "$MODEL_DIR" "$CC" {cb_tokens} {cb_tokens} 512 > "$CB_OUT" 2>&1; then
-      echo "CB_CHILD_FAILED c=$CC" >&2
-      tail -20 "$CB_OUT" >&2 || true
-      echo "RETRYABLE_INFRA_FAILURE concurrent-decode harness exited nonzero at c=$CC" >&2
-      exit 75
+    if ! timeout 900 env "$@" build/runtime/qwen3_gguf_cb_bench "$ckpt" "$cc" {cb_tokens} {cb_tokens} 512 > "$out" 2>&1; then
+      echo "concurrent-decode harness exited nonzero at c=$cc on $ckpt" >&2
+      tail -20 "$out" >&2 || true
+      return 1
     fi
-    CB_TOK=$(sed -n 's/.*decode_tokens=\\([0-9]*\\).*/\\1/p' "$CB_OUT" | tail -1)
-    CB_ERR=$(grep -c "request error" "$CB_OUT" || true)
-    if ! cb_complete "$CC" "${{CB_TOK:-0}}" "${{CB_ERR:-0}}"; then
-      echo "CB_PARTIAL c=$CC attempt=$ATTEMPT decode_tokens=${{CB_TOK:-0}} request_errors=${{CB_ERR:-0}}" >&2
+    CB_TOK=$(sed -n 's/.*decode_tokens=\\([0-9]*\\).*/\\1/p' "$out" | tail -1)
+    CB_ERR=$(grep -c "request error" "$out" || true)
+    if ! cb_complete "$cc" "${{CB_TOK:-0}}" "${{CB_ERR:-0}}"; then
+      echo "CB_PARTIAL c=$cc attempt=$attempt decode_tokens=${{CB_TOK:-0}} request_errors=${{CB_ERR:-0}} ($ckpt)" >&2
       continue
     fi
-    CB_A=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$CB_OUT" | tail -1)
-    CB_I=$(sed -n 's/.*mean_itl_ms=\\([0-9.]*\\).*/\\1/p' "$CB_OUT" | tail -1)
-    CB_AGGS="$CB_AGGS ${{CB_A:-0}}"; CB_ITLS="$CB_ITLS ${{CB_I:-0}}"
-    CB_VALID=$((CB_VALID + 1))
+    a=$(sed -n 's/.*agg_tok_s=\\([0-9.]*\\).*/\\1/p' "$out" | tail -1)
+    i=$(sed -n 's/.*mean_itl_ms=\\([0-9.]*\\).*/\\1/p' "$out" | tail -1)
+    CB_AGGS="$CB_AGGS ${{a:-0}}"; CB_ITLS="$CB_ITLS ${{i:-0}}"
+    valid=$((valid + 1))
   done
   CB_AGG=$(python3 -c "import statistics, sys; print(statistics.median(float(x) for x in sys.argv[1:]))" $CB_AGGS)
   CB_ITL=$(python3 -c "import statistics, sys; print(statistics.median(float(x) for x in sys.argv[1:]))" $CB_ITLS)
+  if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"; then
+    echo "concurrent decode produced no positive metric at c=$cc on $ckpt" >&2
+    return 1
+  fi
+}}
+
+for CC in {cb_concs}; do
+  if ! cb_median "$MODEL_DIR" "$CC" SPARKINFER_QWEN38_PREFILL_NVFP4=1 SPARKINFER_QWEN38_DECODE_NVFP4=1 SPARKINFER_KV_INT8=1; then
+    echo "RETRYABLE_INFRA_FAILURE concurrent decode failed at c=$CC (see above)" >&2
+    exit 75
+  fi
   echo "RESULT_CB${{CC}}_RUNS$CB_AGGS"
   echo "RESULT_CB${{CC}}_TOK ${{CB_TOK:-0}}"
   echo "RESULT_CB${{CC}}_AGG ${{CB_AGG:-0}}"
   echo "RESULT_CB${{CC}}_ITL ${{CB_ITL:-0}}"
   echo "RESULT_CB${{CC}}_ERR ${{CB_ERR:-0}}"
-  if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "${{CB_AGG:-0}}"; then
-    echo "RETRYABLE_INFRA_FAILURE concurrent decode produced no positive metric at c=$CC" >&2
-    tail -20 "$CB_OUT" >&2 || true
-    exit 75
-  fi
 done
 
 # --- teacher-forced score dump (differential accuracy gate, module docstring pt. 2) ---
@@ -984,6 +1020,30 @@ if [ -f "$MUSE_GUARD_GGUF" ]; then
 else
   echo "GUARDMG_UNAVAILABLE"
 fi
+
+# --- Concurrent-decode no-regression guards: ModelOpt and Muse Glimmer (pt. 3b) ---
+# The PRs this bot scores mostly change packed decode, which the single-stream 32k guards above never
+# enter. Each model runs the way its own bot runs it: ModelOpt with pr_dspark_bot.py's env, Muse
+# Glimmer with none (pr_museglimmer_bot.py). A failed measurement prints *_FAILED and the guard fails
+# closed, as the 32k guards do; an absent checkpoint skips both of its guards.
+if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
+  for CC in {cb_guard_concs}; do
+    if cb_median "$MODELOPT_GUARD_MODEL_DIR" "$CC" SPARKINFER_QWEN38_PREFILL_NVFP4=1 SPARKINFER_QWEN38_DECODE_NVFP4=1 SPARKINFER_KV_INT8=1; then
+      echo "GUARDCBMO $CC $CB_AGG"
+    else
+      echo "GUARDCBMO_FAILED $CC"
+    fi
+  done
+fi
+if [ -f "$MUSE_GUARD_GGUF" ]; then
+  for CC in {cb_guard_concs}; do
+    if cb_median "$MUSE_GUARD_GGUF" "$CC"; then
+      echo "GUARDCBMG $CC $CB_AGG"
+    else
+      echo "GUARDCBMG_FAILED $CC"
+    fi
+  done
+fi
 echo "GUARD_END"
 """
 
@@ -997,6 +1057,7 @@ def _parse_remote(stdout: str) -> dict:
     out = {}
     guard36 = {}
     cross_guards = {"GUARDMO": {}, "GUARDMG": {}}
+    cb_guards = {"GUARDCBMO": {}, "GUARDCBMG": {}}
     for line in (stdout or "").splitlines():
         if line.startswith("REMOTE_HEAD "):
             out["head"] = line.split()[1]
@@ -1060,6 +1121,15 @@ def _parse_remote(stdout: str) -> dict:
                     pass
         elif line.strip() == "GUARD36_FAILED":
             out["guard36_failed"] = True
+        elif line.split(" ", 1)[0] in cb_guards:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    cb_guards[parts[0]][int(parts[1])] = {"cb-decode": float(parts[2])}
+                except ValueError:
+                    pass
+        elif line.split(" ", 1)[0] in ("GUARDCBMO_FAILED", "GUARDCBMG_FAILED"):
+            out[line.split(" ", 1)[0].split("_")[0].lower() + "_failed"] = True
         elif line.split(" ", 1)[0] in cross_guards:
             parts = line.split()
             if len(parts) >= 4:
@@ -1075,6 +1145,8 @@ def _parse_remote(stdout: str) -> dict:
     out["guard36"] = guard36
     out["guardmo"] = cross_guards["GUARDMO"]
     out["guardmg"] = cross_guards["GUARDMG"]
+    out["guardcbmo"] = cb_guards["GUARDCBMO"]
+    out["guardcbmg"] = cb_guards["GUARDCBMG"]
     return out
 
 
@@ -1369,10 +1441,14 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     # ModelOpt and Muse Glimmer guards (pt. 3b): same discipline, same hard REJECT. An absent
     # checkpoint is a SKIP, reported as one, so a round that guarded nothing never reads as a pass.
     cross = {}
-    for key, name, check in (("guardmo", "modelopt", check_modelopt_guard),
-                             ("guardmg", "muse glimmer", check_muse_guard)):
+    for key, name, checks in (("guardmo", "modelopt", (check_modelopt_guard, check_modelopt_cb_guard)),
+                              ("guardmg", "muse glimmer", (check_muse_guard, check_muse_cb_guard))):
         skipped = bool(pr.get(f"{key}_unavailable") or main.get(f"{key}_unavailable"))
-        ok, problems = (True, []) if skipped else check(pr, main)
+        ok, problems = True, []
+        if not skipped:
+            for check in checks:
+                c_ok, c_problems = check(pr, main)
+                ok, problems = ok and c_ok, problems + c_problems
         if skipped:
             print(f">> {name} guard SKIPPED — checkpoint not installed on the box")
         if not ok:
@@ -1495,7 +1571,8 @@ def format_comment(commit: str, res: dict) -> str:
             cross_rows += (f"| {name} | ⚠️ SKIPPED — checkpoint not installed on the box; "
                            f"shared-code regressions on {what} were NOT checked |\n")
         elif res.get(f"{prefix}_guard_ok"):
-            cross_rows += f"| {name} | ✅ no regression (decode+prefill @ 32k, {what}) |\n"
+            cross_rows += (f"| {name} | ✅ no regression (decode+prefill @ 32k, concurrent decode @ "
+                           f"{'/'.join(f'c{c}' for c in CB_GUARD_CONCS)}, {what}) |\n")
         else:
             probs = "; ".join((res.get(f"{prefix}_guard_problems") or [])[:4])
             cross_rows += (f"| {name} | ❌ **FAILED** — {probs} — "
@@ -1541,7 +1618,7 @@ def format_comment(commit: str, res: dict) -> str:
         "tier among prefill@16k and concurrent decode @c2–c32. Accuracy is differential: this "
         "build and `main` score the same token stream and must agree. Also gated on no-regression "
         "guards for Qwen3.6 (decode+prefill, ctx 0/512/4k/16k/32k) and for the ModelOpt Qwen3.8 "
-        "checkpoint and Muse Glimmer (decode+prefill @ 32k), because Qwen3.8 PRs can touch code "
+        "checkpoint and Muse Glimmer (decode+prefill @ 32k, concurrent decode @ c16/c32), because Qwen3.8 PRs can touch code "
         "shared with other models. A `none` label means no measurable speedup on these axes, "
         "which is expected if that is not what your change is about.</sub>\n"
     )
@@ -1801,9 +1878,9 @@ def apply_result(repo, num, commit, res, title="", dry_run=False):
             if not res.get("q36_guard_ok", True):
                 fail_clause = "and regressed the Qwen3.6 no-regression guard (decode/prefill on shared code)"
             elif not res.get("modelopt_guard_ok", True):
-                fail_clause = "and regressed the ModelOpt Qwen3.8 no-regression guard (decode/prefill @ 32k)"
+                fail_clause = "and regressed the ModelOpt Qwen3.8 no-regression guard (decode/prefill @ 32k or concurrent decode)"
             elif not res.get("muse_guard_ok", True):
-                fail_clause = "and regressed the Muse Glimmer no-regression guard (decode/prefill @ 32k)"
+                fail_clause = "and regressed the Muse Glimmer no-regression guard (decode/prefill @ 32k or concurrent decode)"
             elif not res.get("accuracy_ok"):
                 fail_clause = "and failed the accuracy gate"
             elif res.get("regressed_dims"):

@@ -238,11 +238,18 @@ applies `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, derives the generic `eval:*` ti
    of Qwen3.8's own result:
    - Qwen3.6: decode + prefill at ctx 0/512/4k/16k/32k;
    - the ModelOpt Qwen3.8 checkpoint and Muse Glimmer: decode + prefill at 32k, the same guards
-     `pr_museglimmer_bot.py` runs.
+     `pr_museglimmer_bot.py` runs, plus concurrent decode at 16 and 32 requests. Each concurrency
+     guard is the median of three complete runs, with each model run the way its own bot runs it.
+     Those guards exist because this bot's PRs mostly change packed decode, which a single-request
+     guard never enters. Two sessions on `main` agreed within 0.7%.
 
    The models share `qwen35.cpp`, `inference_engine.cpp` and the packed-decode kernels. The Muse
    bot skips PRs declared for Qwen3.8 alone, so these guards are the only check such PRs get
    against Muse Glimmer. A checkpoint missing from the box is skipped and reported as skipped.
+
+   The reverse also holds: this bot skips PRs declared for Muse Glimmer alone. So `pr_museglimmer_bot.py`
+   guards the unsloth checkpoint too, with decode + prefill at 32k beside its ModelOpt and Qwen3.6
+   guards.
 
 **Not evaluated:**
 - PRs whose template declares a different target model (#1027).

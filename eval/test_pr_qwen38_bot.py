@@ -23,7 +23,9 @@ class ConcurrencyAxesTests(unittest.TestCase):
         script = bot._remote_script("main", role="main")
         self.assertIn("for CC in 1 2 4 8 16 32; do", script)
         # Same shape and env as pr_dspark_bot.py's ModelOpt rows, so the checkpoints compare.
-        self.assertIn('qwen3_gguf_cb_bench "$MODEL_DIR" "$CC" 256 256 512', script)
+        self.assertIn('cb_median "$MODEL_DIR" "$CC" SPARKINFER_QWEN38_PREFILL_NVFP4=1 '
+                      'SPARKINFER_QWEN38_DECODE_NVFP4=1 SPARKINFER_KV_INT8=1', script)
+        self.assertIn('build/runtime/qwen3_gguf_cb_bench "$ckpt" "$cc" 256 256 512', script)
         for env in ("SPARKINFER_QWEN38_PREFILL_NVFP4=1", "SPARKINFER_QWEN38_DECODE_NVFP4=1",
                     "SPARKINFER_KV_INT8=1"):
             self.assertIn(env, script)
@@ -85,11 +87,11 @@ class ConcurrencyAxesTests(unittest.TestCase):
         # c32 on identical code differs by up to 2.7% run to run -- outside the -2% reject band --
         # so one run per width could REJECT and auto-close an unchanged PR.
         self.assertEqual(bot.CB_REPS, 3)
-        self.assertIn('while [ "$CB_VALID" -lt 3 ]; do', script)
+        self.assertIn('while [ "$valid" -lt 3 ]; do', script)
         self.assertIn("statistics.median", script)
         # A partial run is re-run, never scored; too many of them fail the round as infra.
-        self.assertIn("CB_PARTIAL c=$CC", script)
-        self.assertIn('if [ "$ATTEMPT" -gt 5 ]; then', script)
+        self.assertIn("CB_PARTIAL c=$cc", script)
+        self.assertIn('if [ "$attempt" -gt 5 ]; then', script)
         for kind in ("RUNS", "TOK"):
             self.assertIn(f"RESULT_CB${{CC}}_{kind}", script)
 
@@ -123,7 +125,7 @@ class CrossModelGuardTests(unittest.TestCase):
             self.assertIn(marker, script)
         # GUARD_END is the hard-kill retry's end-of-run marker, so it must come after both guards.
         self.assertLess(script.index("GUARDMG_UNAVAILABLE"), script.index('echo "GUARD_END"'))
-        self.assertIn("v3", bot.EVAL_SCHEMA_VERSION)
+        self.assertIn("cross-model-guards", bot.EVAL_SCHEMA_VERSION)
 
     def test_guard_lines_parse(self):
         out = bot._parse_remote("GUARDMO 32768 90.5 13010.0\nGUARDMG 32768 97.9 10990.0\n")
@@ -165,6 +167,38 @@ class CrossModelGuardTests(unittest.TestCase):
                                            "muse_guard_ok": True})
         self.assertIn("| modelopt guard | ⚠️ SKIPPED", skipped)
         self.assertNotIn("| modelopt guard | ✅", skipped)
+
+
+class ConcurrencyGuardTests(unittest.TestCase):
+    """The 32k guards run one request; this bot's PRs mostly change packed decode."""
+
+    def test_both_models_get_concurrency_guards_before_the_end_marker(self):
+        script = bot._remote_script("main", role="main")
+        self.assertEqual(bot.CB_GUARD_CONCS, [16, 32])
+        self.assertIn('cb_median "$MODELOPT_GUARD_MODEL_DIR" "$CC" SPARKINFER_QWEN38_PREFILL_NVFP4=1', script)
+        self.assertIn('cb_median "$MUSE_GUARD_GGUF" "$CC"; then', script)
+        for marker in ("GUARDCBMO $CC $CB_AGG", "GUARDCBMO_FAILED $CC", "GUARDCBMG $CC $CB_AGG", "GUARDCBMG_FAILED $CC"):
+            self.assertIn(marker, script)
+        self.assertLess(script.index("GUARDCBMG_FAILED"), script.index('echo "GUARD_END"'))
+        self.assertIn("v4", bot.EVAL_SCHEMA_VERSION)
+
+    def test_cb_median_returns_instead_of_exiting(self):
+        script = bot._remote_script("main", role="main")
+        fn = script[script.index("cb_median() {"):script.index("\n}\n", script.index("cb_median() {"))]
+        self.assertNotIn("exit ", fn)
+        self.assertIn("return 1", fn)
+
+    def test_guard_lines_parse_and_a_regression_fails(self):
+        main = bot._parse_remote("GUARDCBMO 16 1080.0\nGUARDCBMO 32 1600.0\nGUARDCBMG 16 400.0\n")
+        self.assertEqual(main["guardcbmo"], {16: {"cb-decode": 1080.0}, 32: {"cb-decode": 1600.0}})
+        pr = bot._parse_remote("GUARDCBMO 16 1079.0\nGUARDCBMO 32 1500.0\nGUARDCBMG_FAILED 16\n")
+        ok, problems = bot.check_modelopt_cb_guard(pr, main)
+        self.assertFalse(ok)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("modelopt concurrent cb-decode@c32", problems[0])
+        ok, problems = bot.check_muse_cb_guard(pr, main)
+        self.assertFalse(ok)
+        self.assertIn("muse glimmer concurrent guard measurement unavailable", problems)
 
 if __name__ == "__main__":
     unittest.main()

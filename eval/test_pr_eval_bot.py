@@ -1248,5 +1248,30 @@ class MuseBotHonoursDeclaredModelTests(unittest.TestCase):
         # Before the greenlight, i.e. before any PR is queued for GPU time.
         self.assertLess(src.index("model_skip_reason"), src.index("greenlight_status"))
 
+
+class MuseBotUnslothGuardTests(unittest.TestCase):
+    """pr_qwen38_bot.py skips PRs declared for Muse Glimmer alone, so the Muse bot must guard the
+    unsloth Qwen3.8 checkpoint that bot scores."""
+
+    def test_remote_script_guards_the_unsloth_checkpoint_before_the_end_marker(self):
+        import pr_museglimmer_bot as muse
+        script = muse._remote_script("main")
+        self.assertIn('bench_sweep_run "$UNSLOTH_GUARD_MODEL_DIR" 128 32768 5', script)
+        for marker in ("GUARDUN $ctx", "GUARDUN_FAILED", "GUARDUN_UNAVAILABLE"):
+            self.assertIn(marker, script)
+        self.assertLess(script.index("GUARDUN_UNAVAILABLE"), script.index('echo "GUARD_END"'))
+        self.assertIn("unsloth", muse.EVAL_SCHEMA_VERSION)
+
+    def test_unsloth_guard_parses_and_fails_on_regression(self):
+        import pr_museglimmer_bot as muse
+        main = muse._parse_remote("GUARDUN 32768 80.6 8727.0\n")
+        self.assertEqual(main["guardun"], {32768: {"decode": 80.6, "prefill": 8727.0}})
+        self.assertEqual(muse.check_unsloth_guard(main, main), (True, []))
+        pr = muse._parse_remote("GUARDUN 32768 70.0 8727.0\n")
+        ok, problems = muse.check_unsloth_guard(pr, main)
+        self.assertFalse(ok)
+        self.assertIn("unsloth qwen3.8 decode@32k", problems[0])
+        self.assertTrue(muse._parse_remote("GUARDUN_UNAVAILABLE\n")["guardun_unavailable"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

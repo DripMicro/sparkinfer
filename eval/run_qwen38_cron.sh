@@ -24,7 +24,8 @@
 #     tick overlaps. Wait a bounded amount instead of failing instantly: long enough to outlast a
 #     quick sibling-bot tick, short enough to still bail if something is genuinely stuck.
 #   • GPU up → full speed eval (prefill@16k, concurrent decode c1..c32, floors) + differential
-#     accuracy + Qwen3.6, ModelOpt Qwen3.8 and Muse Glimmer no-regression guards;
+#     accuracy + Qwen3.6, ModelOpt Qwen3.8 and Muse Glimmer no-regression guards (the last two
+#     also at 16 and 32 concurrent requests);
 #     GPU down → --labels-only (no GPU, no ssh, pure label reconciliation).
 #   • Auto-merge follows SPARKINFER_QWEN38_AUTOMERGE, which .env.eval sets to 1 (explicit
 #     decision 2026-08-15). This script never forces it.
