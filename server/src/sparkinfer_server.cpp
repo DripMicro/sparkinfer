@@ -52,6 +52,70 @@ int max_output_tokens() {
     return v;
 }
 
+// Sampling for requests that leave temperature / top_k / top_p out (#1088). They used to be decoded
+// greedily. Agent clients such as pi (prime-agent) send none of them, and a thinking model decoded
+// greedily falls into repetition loops on long tasks -- Qwen's own guidance is not to use greedy
+// decoding for thinking mode. llama.cpp samples by default and vLLM applies generation_config.json,
+// so the same requests behaved differently there. The checkpoint's generation_config.json values
+// now fill in whatever a request omits; an explicit value, including temperature 0, always wins.
+// Greedy stays the default with SPARKINFER_SAMPLING_DEFAULTS=greedy, when the checkpoint has no such
+// file (a GGUF), and under SPARKINFER_DETERMINISTIC=1, whose bit-reproducibility a random per-request
+// seed would break.
+struct SamplingDefaults {
+    bool active = false;
+    float temperature = 0.f;
+    int top_k = 0;
+    float top_p = 1.0f;
+};
+SamplingDefaults g_sampling_defaults;
+
+void load_sampling_defaults(const std::string& model_path) {
+    const char* mode = getenv("SPARKINFER_SAMPLING_DEFAULTS");
+    const std::string m = mode ? mode : "generation_config";
+    auto greedy = [](const std::string& why) {
+        fprintf(stderr, "[sparkinfer-server] sampling defaults: greedy for requests that omit "
+                        "temperature/top_k/top_p (%s)\n", why.c_str());
+    };
+    if (m == "greedy") return greedy("SPARKINFER_SAMPLING_DEFAULTS=greedy");
+    if (m != "generation_config") {
+        fprintf(stderr, "[sparkinfer-server] SPARKINFER_SAMPLING_DEFAULTS=%s is not greedy or "
+                        "generation_config -- using generation_config\n", m.c_str());
+    }
+    if (sparkinfer::deterministic_mode()) return greedy("SPARKINFER_DETERMINISTIC=1");
+    std::ifstream f(model_path + "/generation_config.json");
+    if (!f) return greedy("no generation_config.json beside the checkpoint");
+    nlohmann::json g;
+    try { f >> g; } catch (const std::exception& e) {
+        return greedy(std::string("generation_config.json unreadable: ") + e.what());
+    }
+    if (g.contains("do_sample") && g["do_sample"].is_boolean() && !g["do_sample"].get<bool>())
+        return greedy("generation_config.json has do_sample=false");
+    SamplingDefaults d;
+    if (g.contains("temperature") && g["temperature"].is_number()) {
+        const double t = g["temperature"].get<double>();
+        if (t >= 0.0 && t <= 2.0) d.temperature = static_cast<float>(t);
+    }
+    if (g.contains("top_k") && g["top_k"].is_number_integer() && g["top_k"].get<long long>() >= 0)
+        d.top_k = static_cast<int>(std::min<long long>(g["top_k"].get<long long>(), 1 << 20));
+    if (g.contains("top_p") && g["top_p"].is_number()) {
+        const double p = g["top_p"].get<double>();
+        if (p > 0.0 && p <= 1.0) d.top_p = static_cast<float>(p);
+    }
+    if (d.temperature <= 0.f) return greedy("generation_config.json sets no positive temperature");
+    d.active = true;
+    g_sampling_defaults = d;
+    fprintf(stderr, "[sparkinfer-server] sampling defaults from generation_config.json: temperature=%.2f "
+                    "top_k=%d top_p=%.2f for requests that omit them (SPARKINFER_SAMPLING_DEFAULTS=greedy "
+                    "to decode those greedily)\n", d.temperature, d.top_k, d.top_p);
+}
+
+void apply_sampling_defaults(sparkinfer_server::RequestControls& c) {
+    if (!g_sampling_defaults.active) return;
+    if (!c.temperature_set) c.temperature = g_sampling_defaults.temperature;
+    if (!c.top_k_set) c.top_k = g_sampling_defaults.top_k;
+    if (!c.top_p_set) c.top_p = g_sampling_defaults.top_p;
+}
+
 int sse_keepalive_seconds() {
     static int v = [] {
         const char* e = getenv("SPARKINFER_SSE_KEEPALIVE_SECONDS");
@@ -918,6 +982,7 @@ int main(int argc, char** argv) {
 
     sparkinfer_server::ModelEngine engine;
     if (!engine.load(model_path, ctx > 0 ? ctx : 0)) return 1;
+    load_sampling_defaults(model_path);
 
     // Name what was actually loaded. Without this the server reports "qwen3.6-35b-a3b" whatever
     // it is serving -- a client asking Qwen3.8 a question is told it spoke to Qwen3.6, and every
@@ -1111,6 +1176,7 @@ int main(int argc, char** argv) {
         std::ostringstream body;
         const int cap = engine.max_queue_depth();
         body << "{\"active_requests\":" << engine.active_requests()
+             << ",\"waiting_requests\":" << engine.waiting_requests()
              << ",\"free_kv_blocks\":" << engine.free_kv_blocks()
              << ",\"max_queue_depth\":" << cap
              << ",\"accepting_requests\":" << (g_shutdown_requested.load() ? "false" : "true") << "}";
@@ -1164,6 +1230,15 @@ int main(int argc, char** argv) {
                 "# HELP sparkinfer_active_requests In-flight requests\n"
                 "# TYPE sparkinfer_active_requests gauge\n"
              << "sparkinfer_active_requests " << engine.active_requests() << "\n"
+                "# HELP sparkinfer_waiting_requests Requests waiting for KV capacity\n"
+                "# TYPE sparkinfer_waiting_requests gauge\n"
+             << "sparkinfer_waiting_requests " << engine.waiting_requests() << "\n"
+                "# HELP sparkinfer_admission_waits_total Requests that waited for KV capacity\n"
+                "# TYPE sparkinfer_admission_waits_total counter\n"
+             << "sparkinfer_admission_waits_total " << engine.admission_waits() << "\n"
+                "# HELP sparkinfer_admission_wait_timeouts_total Requests rejected after waiting for capacity\n"
+                "# TYPE sparkinfer_admission_wait_timeouts_total counter\n"
+             << "sparkinfer_admission_wait_timeouts_total " << engine.admission_timeouts() << "\n"
                 "# HELP sparkinfer_free_kv_blocks Free KV cache blocks\n"
                 "# TYPE sparkinfer_free_kv_blocks gauge\n"
              << "sparkinfer_free_kv_blocks " << engine.free_kv_blocks() << "\n";
@@ -1376,6 +1451,9 @@ int main(int argc, char** argv) {
             } else if (outcome.alloc_failed) {
                 g_requests_server_error++;
                 fail(503, outcome.error);
+            } else if (outcome.internal_error) {
+                g_requests_server_error++;
+                fail(500, outcome.error);
             } else if (outcome.timed_out) {
                 g_requests_timeout++;
                 fail(504, outcome.error);
@@ -1483,6 +1561,7 @@ int main(int argc, char** argv) {
                  // The HTTP server runs ContinuousBatchEngine, whose request path is currently
                  // autoregressive even when the standalone DFlash benchmark env var is present.
                  // Do not reject valid OpenAI sampling controls based on an unrelated process env.
+                 apply_sampling_defaults(controls);
                  if (!controls.seed_set) {
                      static thread_local std::random_device rd;
                      controls.seed = ((uint64_t)rd() << 32) | rd();
@@ -1490,9 +1569,13 @@ int main(int argc, char** argv) {
                  const bool stream = controls.stream;
                  if (stream) g_requests_streaming++;
                  const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
-                 int max_tokens = controls.max_tokens;
-                 if (max_tokens <= 0) max_tokens = 256;
-                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
+                 // Without max_tokens, generate until the model stops, up to the output cap and the
+                 // room the prompt leaves in the context (fitted once the prompt is tokenized). That
+                 // is what an OpenAI client that omits it expects, and what llama.cpp does. It was
+                 // 256, which cut agents' long answers and tool calls off mid-output (#1088).
+                 const bool max_tokens_set = controls.max_tokens > 0;
+                 int max_tokens = max_tokens_set ? std::min(controls.max_tokens, max_output_tokens())
+                                                 : max_output_tokens();
 
                  std::vector<int> prompt_ids;
                  sparkinfer_server::ChatRequest chat_request;
@@ -1600,14 +1683,14 @@ int main(int argc, char** argv) {
                  // rejects tools + response_format together at request time.
                  const bool json_mode_active =
                      chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText;
+                 if (!max_tokens_set)
+                     max_tokens = std::max(1, std::min(max_tokens, engine.max_seq() - (int)prompt_ids.size()));
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
-                     res.set_content(
-                         "{\"error\":{\"message\":\"context overflow: prompt=" +
-                         std::to_string(prompt_ids.size()) + " max_tokens=" + std::to_string(max_tokens) +
-                         " exceeds server ctx=" + std::to_string(engine.max_seq()) + "\"}}",
-                         "application/json");
+                     res.set_content(sparkinfer_server::context_length_exceeded_error_json(
+                                         prompt_ids.size(), max_tokens, engine.max_seq(), /*chat=*/true),
+                                     "application/json");
                      return;
                  }
 
@@ -1628,6 +1711,7 @@ int main(int argc, char** argv) {
                      if (o.overloaded)   return 429;
                      if (o.alloc_failed) return 503;
                      if (o.timed_out)    return 504;
+                     if (o.internal_error) return 500;
                      return 400;
                  };
 
@@ -1637,7 +1721,7 @@ int main(int argc, char** argv) {
                      res.set_chunked_content_provider(
                          stream_dialect_of(req) == StreamDialect::OllamaNdjson
                              ? "application/x-ndjson" : "text/event-stream",
-                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
+                         [&engine, prompt_ids, max_tokens, max_tokens_set, cid, created, enable_thinking,
                           // BY VALUE, like prompt_ids beside it: this provider runs after the
                           // handler returns, so a reference would dangle. Cheap -- PreparedImages
                           // shares its pixel buffers rather than owning them.
@@ -1755,7 +1839,10 @@ int main(int argc, char** argv) {
                                  bool ok = false;
                                  std::string validation_err;
                                  for (int attempt = 1; attempt <= 2; ++attempt) {
-                                     if ((int)cur_prompt_ids.size() + max_tokens > engine.max_seq()) {
+                                     // Without max_tokens, re-fit the budget to this attempt's prompt, which grows on a retry.
+                                     const int attempt_max = max_tokens_set ? max_tokens
+                                         : std::max(1, std::min(max_tokens, engine.max_seq() - (int)cur_prompt_ids.size()));
+                                     if ((int)cur_prompt_ids.size() + attempt_max > engine.max_seq()) {
                                          validation_err = "retry prompt exceeds server context";
                                          break;
                                      }
@@ -1775,7 +1862,7 @@ int main(int argc, char** argv) {
                                          }
                                          return sink.is_writable();
                                      };
-                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
+                                     outcome = engine.complete_streaming(cur_prompt_ids, attempt_max, on_tok,
                                          temperature, branch_seed, top_k, top_p, presence_penalty,
                                          frequency_penalty, logit_bias, false, 0, nullptr, {},
                                          &cur_images,
@@ -1856,6 +1943,13 @@ int main(int argc, char** argv) {
                                  sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking, engine.is_museglimmer());
                                  sparkinfer_server::StopSequenceFilter stop_filter(stop);
                                  std::string tool_stop_text;  // raw accumulator, tool_protocol branch only
+                                 // tool_protocol only: the reasoning is streamed as it is generated, and only
+                                 // the answer and its tool calls wait for the complete output (see on_tok).
+                                 const bool stream_tool_reasoning = tool_protocol && enable_thinking &&
+                                                                    !chat_request.reasoning_exclude;
+                                 sparkinfer_server::ThinkingStreamSplitter tool_splitter(enable_thinking, engine.is_museglimmer());
+                                 sparkinfer_server::StopSequenceFilter tool_reasoning_stop(stop);
+                                 bool tool_reasoning_streamed = false;
                                  bool stopped_by_sequence = false;
                                  // Scoped out of tool-calling responses (buffered, no live content
                                  // emission at all -- see the DFlash-check comment above for the
@@ -1878,18 +1972,36 @@ int main(int argc, char** argv) {
                                      return lp;
                                  };
                                  auto on_tok = [&](int tid) -> bool {
-                                     // Tool-capable responses are intentionally buffered until the
-                                     // native Qwen XML is complete and schema-valid.
+                                     // Tool-capable responses buffer the answer until the native Qwen
+                                     // XML is complete and schema-valid. The reasoning before it is
+                                     // not tool markup, and streams as it is generated: buffered too,
+                                     // an agent saw nothing but heartbeats for the minutes a long
+                                     // thinking turn takes, then -- when that turn ran out of
+                                     // max_tokens -- an empty message (#1088).
                                      if (tool_protocol) {
-                                         if (stop.empty()) {
+                                         if (stop.empty() && !stream_tool_reasoning) {
                                              stream_ids.push_back(tid);
                                              return sink.is_writable();
                                          }
-                                         tool_stop_text += g_tokenizer.decode_delta(stream_ids, tid);
-                                         size_t pos;
-                                         if (find_stop_match(tool_stop_text, stop, pos)) {
-                                             stopped_by_sequence = true;
-                                             return false;
+                                         const std::string piece = g_tokenizer.decode_delta(stream_ids, tid);
+                                         if (!stop.empty()) {
+                                             tool_stop_text += piece;
+                                             size_t pos;
+                                             if (find_stop_match(tool_stop_text, stop, pos)) {
+                                                 stopped_by_sequence = true;
+                                                 return false;
+                                             }
+                                         }
+                                         if (stream_tool_reasoning) {
+                                             // The answer the splitter returns is ignored: it is
+                                             // emitted, parsed, once generation ends.
+                                             const auto delta = tool_splitter.feed(tool_reasoning_stop.feed(piece));
+                                             if (!delta.reasoning_content.empty()) {
+                                                 tool_reasoning_streamed = true;
+                                                 if (!write_stream_reasoning_delta(gs, cid, created,
+                                                                                   delta.reasoning_content, ci))
+                                                     return false;
+                                             }
                                          }
                                          return sink.is_writable();
                                      }
@@ -2011,6 +2123,17 @@ int main(int argc, char** argv) {
                                      out->generation_ms = outcome.generation_ms;
                                      out->decode_tps = outcome.decode_tps;
                                      out->ok = true;
+                                     if (tool_reasoning_streamed) {
+                                         // A turn that ended inside its reasoning still holds back a
+                                         // possible partial "</think>"; a stop match ends at the match.
+                                         if (!stopped_by_sequence) {
+                                             sparkinfer_server::ThinkingStreamSplitter::Delta tail;
+                                             tool_splitter.finish(tail);
+                                             write_stream_reasoning_delta(gs, cid, created, tail.reasoning_content, ci);
+                                         }
+                                         // Already on the wire; emitting it again would double it.
+                                         out->parsed.reasoning_content.clear();
+                                     }
                                      emit_buffered_output(ci, out->parsed, out->finish_reason);
                                      return;
                                  }
@@ -2237,7 +2360,10 @@ int main(int argc, char** argv) {
                          bool ok = false;
                          std::string validation_err;
                          for (int attempt = 1; attempt <= 2; ++attempt) {
-                             if ((int)cur_prompt_ids.size() + max_tokens > engine.max_seq()) {
+                             // Without max_tokens, re-fit the budget to this attempt's prompt, which grows on a retry.
+                             const int attempt_max = max_tokens_set ? max_tokens
+                                 : std::max(1, std::min(max_tokens, engine.max_seq() - (int)cur_prompt_ids.size()));
+                             if ((int)cur_prompt_ids.size() + attempt_max > engine.max_seq()) {
                                  validation_err = "retry prompt exceeds server context";
                                  break;
                              }
@@ -2257,7 +2383,7 @@ int main(int argc, char** argv) {
                                  }
                                  return true;
                              };
-                             outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
+                             outcome = engine.complete_streaming(cur_prompt_ids, attempt_max, on_tok,
                                  controls.temperature, branch_seed, controls.top_k, controls.top_p,
                                  controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                                  false, 0, nullptr, {}, &cur_images,
@@ -2430,9 +2556,16 @@ int main(int argc, char** argv) {
                              if (truncated) {
                                  log_truncated_output("tool-call", text);
                                  // Never expose a truncated native tag sequence. A length/stop end
-                                 // is a valid completion, so return an empty assistant result
-                                 // instead of a hard failure.
+                                 // is a valid completion, so return the turn's reasoning and nothing
+                                 // else instead of a hard failure. Dropping the reasoning as well
+                                 // handed a client that waited out a 16K-token turn an empty message
+                                 // with no sign of what the model had been doing (#1088).
+                                 std::string kept_reasoning;
+                                 if (!engine.is_museglimmer() && !chat_request.reasoning_exclude)
+                                     kept_reasoning = sparkinfer_server::parse_plain_assistant_output(
+                                         text, enable_thinking).reasoning_content;
                                  parsed = {};
+                                 parsed.reasoning_content = std::move(kept_reasoning);
                              } else {
                                  out.http_status = 502;
                                  out.fail = NonStreamBranchOutcome::Fail::invalid_tool_output;
@@ -2636,15 +2769,20 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
+                 apply_sampling_defaults(controls);
                  if (!controls.seed_set) {
                      static thread_local std::random_device rd;
                      controls.seed = ((uint64_t)rd() << 32) | rd();
                  }
                  const bool stream = controls.stream;
                  if (stream) g_requests_streaming++;
-                 int max_tokens = controls.max_tokens;
-                 if (max_tokens <= 0) max_tokens = 256;
-                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
+                 // Without max_tokens, generate until the model stops, up to the output cap and the
+                 // room the prompt leaves in the context (fitted once the prompt is tokenized). That
+                 // is what an OpenAI client that omits it expects, and what llama.cpp does. It was
+                 // 256, which cut agents' long answers and tool calls off mid-output (#1088).
+                 const bool max_tokens_set = controls.max_tokens > 0;
+                 int max_tokens = max_tokens_set ? std::min(controls.max_tokens, max_output_tokens())
+                                                 : max_output_tokens();
 
                  const std::vector<int> prompt_ids = g_tokenizer.encode_raw(prompt);
                  if (prompt_ids.empty()) {
@@ -2654,14 +2792,14 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
+                 if (!max_tokens_set)
+                     max_tokens = std::max(1, std::min(max_tokens, engine.max_seq() - (int)prompt_ids.size()));
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
-                     res.set_content(
-                         "{\"error\":{\"message\":\"context overflow: prompt=" +
-                         std::to_string(prompt_ids.size()) + " max_tokens=" + std::to_string(max_tokens) +
-                         " exceeds server ctx=" + std::to_string(engine.max_seq()) + "\"}}",
-                         "application/json");
+                     res.set_content(sparkinfer_server::context_length_exceeded_error_json(
+                                         prompt_ids.size(), max_tokens, engine.max_seq(), /*chat=*/false),
+                                     "application/json");
                      return;
                  }
 
@@ -2673,6 +2811,7 @@ int main(int argc, char** argv) {
                      if (o.overloaded)   return 429;
                      if (o.alloc_failed) return 503;
                      if (o.timed_out)    return 504;
+                     if (o.internal_error) return 500;
                      return 400;
                  };
 

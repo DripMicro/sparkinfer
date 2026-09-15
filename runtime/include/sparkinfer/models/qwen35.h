@@ -612,7 +612,8 @@ public:
     // Disables CUDA-graph replay while enabled (capture needs eager layer outputs).
     // context_end > 0 sizes the context buffer for positions below it instead of max_seq -- at a
     // server context of 256K the unbounded buffer is tens of GB. On allocation failure the buffers
-    // are left null; check dflash_context_buffer() / dflash_hidden_buffer().
+    // are left null; check dflash_context_buffer() / dflash_hidden_buffer(). Turning capture off
+    // frees both.
     void set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows = 16,
                             int context_start = 0, int context_end = 0);
     void set_dflash_capture_row(int row);

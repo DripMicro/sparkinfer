@@ -48,6 +48,17 @@ double request_timeout_s_config() {
     return s;
 }
 
+// How long a request that finds no free KV capacity waits for it, first come first served, before
+// it is rejected as overloaded (#1088). 0 restores the old immediate 429. The default matches the
+// server's 300 s socket timeouts.
+double admission_wait_s_config() {
+    static double s = []{
+        const char* e = getenv("SPARKINFER_ADMISSION_WAIT_S");
+        return e ? std::max(0.0, atof(e)) : 300.0;
+    }();
+    return s;
+}
+
 }  // namespace
 
 struct ContinuousBatchEngine::Job {
@@ -78,6 +89,7 @@ struct ContinuousBatchEngine::Job {
     bool overloaded = false;
     bool timed_out = false;
     bool cancelled = false;
+    bool internal_error = false;
     bool reached_token_limit = false;
 
     std::chrono::steady_clock::time_point t_submit{};
@@ -134,12 +146,79 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
     const std::function<void(const Qwen35Model::TokenLogprob&)>& on_token_logprob) {
     uint64_t rid = 0;
     EnqueueError err = EnqueueError::NONE;
+    bool gave_up = false, deadline_ran_out = false;
     {
-        std::lock_guard<std::mutex> lock(mu_);
-        Job job;
-        job.req = req;
-        job.prefill_pos = req.prefill_start;
-        rid = submit_locked(std::move(job), on_token, on_token_logprob, &err);
+        std::unique_lock<std::mutex> lock(mu_);
+        // Every request reserves KV for its prompt plus max_tokens when it is admitted, so a few
+        // agents asking for long outputs can hold the whole pool. Such a request used to be
+        // rejected with 429 at once, which clients like prime-agent surface as a failed turn
+        // (#1088). It now waits for capacity, oldest first, woken whenever a job finishes or
+        // completes its prefill (the worker notifies cv_). A device allocation that fails while
+        // other requests run waits too: see alloc_wait below. The queue-depth cap still rejects
+        // new arrivals at once, and a bad request, or an allocation failure with nothing else
+        // running, never waits.
+        const double wait_s = admission_wait_s_config();
+        const double timeout_s = request_timeout_s_config();
+        const double limit_s = timeout_s > 0 ? std::min(wait_s, timeout_s) : wait_s;
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(limit_s));
+        uint64_t ticket = 0;
+        bool queued = false;
+        bool alloc_wait = false;
+        for (;;) {
+            const bool my_turn = limit_s <= 0 || waiting_.empty() ||
+                                 (queued && *waiting_.begin() == ticket);
+            if (my_turn) {
+                Job job;
+                job.req = req;
+                job.prefill_pos = req.prefill_start;
+                rid = submit_locked(std::move(job), on_token, on_token_logprob, &err);
+                if (rid || limit_s <= 0 || !running_) break;
+                // A session allocation that fails while other requests run is capacity, not the
+                // card: their prefill scratch and session state come back as they progress. With
+                // concurrent 20K-token prompts on serve-dspark at --ctx 131072, every request
+                // arriving while one prefilled was refused as "device out of memory ... requires
+                // operator attention", and requests that would have fit a moment later failed
+                // (#1088). With nothing else running, it is the card, and still a 503.
+                alloc_wait = err == EnqueueError::ALLOC_FAILED && !device_lost() && active_jobs_locked() > 0;
+                if (err != EnqueueError::OVERLOADED && !alloc_wait) break;
+            }
+            if (!queued) {
+                if (queue_depth_full_locked()) { err = EnqueueError::OVERLOADED; break; }
+                ticket = next_wait_ticket_++;
+                waiting_.insert(ticket);
+                queued = true;
+                admission_waits_.fetch_add(1, std::memory_order_relaxed);
+            }
+            // Memory can also come back without a job finishing or completing its prefill (a
+            // speculative run's teardown, say), so an allocation wait retries every 2 s as well.
+            const auto wake = alloc_wait ? std::min(deadline, std::chrono::steady_clock::now() +
+                                                                  std::chrono::seconds(2))
+                                         : deadline;
+            if (cv_.wait_until(lock, wake) == std::cv_status::timeout &&
+                std::chrono::steady_clock::now() >= deadline) {
+                gave_up = true;
+                deadline_ran_out = timeout_s > 0 && timeout_s <= wait_s;
+                break;
+            }
+        }
+        if (queued) {
+            waiting_.erase(ticket);
+            cv_.notify_all();   // the next waiter's turn
+        }
+    }
+    if (!rid && gave_up) {
+        admission_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        Result out;
+        if (deadline_ran_out) {
+            out.timed_out = true;
+            out.error = "request timed out waiting for capacity (SPARKINFER_REQUEST_TIMEOUT_S)";
+        } else {
+            out.overloaded = true;
+            out.error = "server overloaded: no capacity for this request within SPARKINFER_ADMISSION_WAIT_S";
+        }
+        return out;
     }
     if (!rid) {
         Result out;
@@ -169,6 +248,32 @@ int ContinuousBatchEngine::num_active() const {
 }
 
 int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blocks(); }
+
+int ContinuousBatchEngine::num_waiting() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (int)waiting_.size();
+}
+
+uint64_t ContinuousBatchEngine::admission_waits() const {
+    return admission_waits_.load(std::memory_order_relaxed);
+}
+
+uint64_t ContinuousBatchEngine::admission_timeouts() const {
+    return admission_timeouts_.load(std::memory_order_relaxed);
+}
+
+int ContinuousBatchEngine::active_jobs_locked() const {
+    int active = 0;
+    for (const auto& kv : jobs_) if (!kv.second->done) active++;
+    return active;
+}
+
+// New arrivals only: a request already waiting is never pushed out by the cap it was admitted under.
+bool ContinuousBatchEngine::queue_depth_full_locked() const {
+    const int cap = max_queue_depth_config();
+    if (cap <= 0) return false;
+    return active_jobs_locked() + (int)waiting_.size() >= cap;
+}
 
 bool ContinuousBatchEngine::apply_constraint_mask(Job& job) {
     // Far below any real logit, finite so temperature scaling and logsumexp stay finite too.
@@ -296,6 +401,7 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     if (r.failed || r.emitted != job.decode_emitted ||
         (!r.finished && !hit_eos && !hit_limit && r.position != prompt_len + job.decode_emitted)) {
         job.error = "speculative decode failed; the request was aborted";
+        job.internal_error = true;
         finish();
         return;
     }
@@ -455,6 +561,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.overloaded = it->second->overloaded;
     out.timed_out = it->second->timed_out;
     out.cancelled = it->second->cancelled;
+    out.internal_error = it->second->internal_error;
     out.reached_token_limit = it->second->reached_token_limit;
     out.ttft_ms = it->second->ttft_ms;
     out.generation_ms = it->second->generation_ms;
@@ -891,6 +998,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         if (!job.req.mrope_pos.empty()) model_->clear_pending_mrope();
         job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
+            // The prefill's scratch memory is back: a request waiting on a failed allocation retries.
+            cv_.notify_all();
             // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's
             // forward_token doc comment): ingest_prompt_range() is a single funnel shared by
             // cache_prefix()'s exclusive-session path and several other internal call sites, so

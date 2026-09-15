@@ -706,11 +706,18 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // first wired for. Qwen3.8 is GQA-6 (24 q over 4 kv), matched neither predicate, and has
     // therefore been reading the WHOLE KV cache on every decode step -- 8.59 GB at ctx=262144,
     // which nsys puts at 9.56 ms of a 19.87 ms step (48%) and only 50% of DRAM peak.
-    // SPARKINFER_SPARSE_GQA6=0 restores the dense path for A/B in one binary.
+    //
+    // Opt-in (SPARKINFER_SPARSE_GQA6=1), not the default. The view is an approximation, not a
+    // lossless kernel: from min_ctx on, decode attends the sink and the last 4096 tokens and
+    // nothing in between (#958 said so; its accuracy gate never reached min_ctx). An agent
+    // session passes 16K tokens within a few turns, and from there Qwen3.8 could not read back:
+    // pi read a 31K-token tool result and described it as a column of integers, and a line
+    // 20K tokens back was reported absent (#1088). Exact attention costs decode throughput at
+    // long context (95 -> 85.7 tok/s at ctx=32768 in #958); that is the price of the answer.
     const int gqa_ratio = cfg.n_kv_heads > 0 ? cfg.n_q_heads / cfg.n_kv_heads : 0;
     static const bool sparse_gqa6_on = [] {
         const char* e = getenv("SPARKINFER_SPARSE_GQA6");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     const bool sparse_gqa6 = sparse_gqa6_on && cfg.head_dim == 256 && cfg.n_kv_heads > 0 &&
                              cfg.n_q_heads == cfg.n_kv_heads * 6;
@@ -3338,22 +3345,39 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     Impl& s = *p_;
     const int n = end - start;
     const int window = prefill_window_tokens();
+    int done = 0;
+    auto run = [&](int step) -> int {
+        for (int pos = start + done; pos < end; pos += step) {
+            const int len = std::min(step, end - pos);
+            const bool last = (pos + len >= end);
+            const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+            if (seed < 0) return -1;
+            if (last) {
+                if (seed >= s.cfg.vocab) return -1;
+                done = n;
+                return seed;
+            }
+            done = pos + len - start;
+        }
+        return -1;
+    };
     // Same split as prefill_batched_chunked: one pass up to the single-pass threshold, windows
     // above it. Every pass here has pos0 > 0, so each runs eager and carries the recurrence forward.
-    const int step = (window <= 0 || n <= prefill_single_pass_max_tokens()) ? n : window;
-    for (int pos = start; pos < end; pos += step) {
-        const int len = std::min(step, end - pos);
-        const bool last = (pos + len >= end);
-        const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
-        if (seed < 0) return -1;
-        if (last) {
-            if (seed >= s.cfg.vocab) return -1;
-            if (out_done) *out_done = n;
-            return seed;
-        }
-        if (out_done) *out_done = pos + len - start;
+    const bool single = window <= 0 || n <= prefill_single_pass_max_tokens();
+    int seed = run(single ? n : window);
+    // ...and the same retry when the single pass declines. A cached prefix followed by a long
+    // continuation is what an agent sends after a large tool result, and on serve-dspark at
+    // --ctx 131072 the 31K-token pass's scratch arena did not fit (free=31 MB): the WHOLE
+    // continuation went to the token loop, minutes instead of seconds (#1088). A pass declines
+    // before its first kernel runs -- see the pos0 != 0 note in prefill_batched_run -- so
+    // nothing of it landed, and windowing from `start` continues the same state.
+    if (seed < 0 && single && done == 0 && window > 0 && n > window) {
+        fprintf(stderr, "[prefill] resumed single pass declined at n=%d -- windowing (%d) instead "
+                        "of the token loop\n", n, window);
+        seed = run(window);
     }
-    return -1;
+    if (out_done) *out_done = done;
+    return seed;
 }
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
@@ -3858,7 +3882,15 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
     s.dflash_ctx_len = 0;
     s.dflash_ctx_start = std::max(0, std::min(context_start, s.cfg.max_seq));
     invalidate_decode_graph();
-    if (!on) return;
+    if (!on) {
+        // The buffers go with the capture. They are sized for one generation -- ~0.5 GB for a
+        // 20K-token prompt -- and were held until the NEXT speculative run, which left that much
+        // less for every other request's prefill scratch and session state: concurrent 20K-token
+        // requests on serve-dspark at --ctx 131072 ran out of device memory (#1088).
+        if (s.dflash_hidden) { cudaFree(s.dflash_hidden); s.dflash_hidden = nullptr; }
+        if (s.dflash_context) { cudaFree(s.dflash_context); s.dflash_context = nullptr; }
+        return;
+    }
     const int H = s.cfg.hidden;
     const size_t row_elems = (size_t)s.dflash_n_cap * H;
     const size_t hidden_bytes = (size_t)s.dflash_max_rows * row_elems * sizeof(bf16);
@@ -4155,9 +4187,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         capture_start = (int)prompt.size() - 4096;
     }
     if (hooks) {
-        // The draft's KV holds the captured window plus everything generated. Past its max_seq
-        // forward_block fails mid-generation, so do not start what cannot finish.
-        const long draft_need = (long)((int)prompt.size() - capture_start) + max_new + 2L * (B + 1);
+        // Past its max_seq the draft's forward_block fails mid-generation, so do not start what
+        // cannot finish. The bound is on ABSOLUTE positions, the whole prompt plus everything
+        // generated: forward_block checks the context end, not the size of the captured window.
+        // Checking only the window let a prompt longer than the draft context through, so the
+        // first draft step failed and the request was aborted with "speculative decode failed"
+        // (#1088: every greedy plain-text request over ~16K tokens on serve-dspark). Such a
+        // request stays on ordinary decode.
+        const long draft_need = (long)prompt.size() + max_new + 2L * (B + 1);
         if (draft_need > dc.max_seq) return out;
     }
     // Engine-driven: requests are admitted concurrently, and admission allocates KV and opens

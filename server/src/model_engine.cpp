@@ -802,6 +802,21 @@ int ModelEngine::active_requests() const {
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_active() : 0;
 }
 
+int ModelEngine::waiting_requests() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_waiting() : 0;
+}
+
+uint64_t ModelEngine::admission_waits() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->admission_waits() : 0;
+}
+
+uint64_t ModelEngine::admission_timeouts() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->admission_timeouts() : 0;
+}
+
 int ModelEngine::free_kv_blocks() const {
     std::lock_guard<std::mutex> lock(mu_);
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_free_kv_blocks() : 0;
@@ -1062,6 +1077,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     out.alloc_failed = result.alloc_failed;
     out.timed_out = result.timed_out;
     out.cancelled = result.cancelled;
+    out.internal_error = result.internal_error;
     out.reached_token_limit = result.reached_token_limit;
     out.ttft_ms = result.ttft_ms;
     out.generation_ms = result.generation_ms;
@@ -1077,8 +1093,13 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
         return out;
     }
 
+    // Only an error that kills the context fails a request the engine completed.
+    // cudaGetLastError returns the last error ANY call raised, and an allocation failure another
+    // path already handled -- a prefill scratch arena falling back to windows, another request's
+    // session refused -- is not this request's: it turned 117 finished requests into
+    // "cuda error after decode: out of memory" under concurrent long prompts (#1088).
     cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
+    if (sparkinfer::is_unrecoverable(e)) {
         out.error = std::string("cuda error after decode: ") + cudaGetErrorString(e);
         fprintf(stderr, "[sparkinfer-server] %s\n", out.error.c_str());
         return out;
