@@ -1189,6 +1189,21 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_truncated_tool_turn_keeps_reasoning() {
+    // #1088: a tool-calling turn that runs out of max_tokens returns its reasoning, not an empty
+    // message. The server recovers it with the plain parser, so pin what that parser yields for
+    // the two ways such a turn ends.
+    const PlainAssistantOutput in_think =
+        parse_plain_assistant_output("Planning the essay.\nFirst the history", true);
+    CHECK(in_think.reasoning_content == "Planning the essay.\nFirst the history");
+    CHECK(in_think.content.empty());
+    const PlainAssistantOutput in_call = parse_plain_assistant_output(
+        "Planning.\n</think>\n\n<tool_call>\n<function=write>\n<parameter=content>\nCats were", true);
+    CHECK(in_call.reasoning_content == "Planning.");
+    CHECK(in_call.reasoning_content.find("<tool_call>") == std::string::npos);
+    return true;
+}
+
 bool test_request_controls_sampling_set_flags() {
     // #1088: an omitted sampling control must stay distinguishable from an explicit one, so the
     // server can fill in the checkpoint's generation_config.json values without overriding a client
@@ -1971,6 +1986,7 @@ int main() {
     if (!test_validate_response_format_json_schema()) return 1;
     if (!test_request_controls_temperature_validation()) return 1;
     if (!test_request_controls_sampling_set_flags()) return 1;
+    if (!test_truncated_tool_turn_keeps_reasoning()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;

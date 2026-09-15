@@ -1945,6 +1945,13 @@ int main(int argc, char** argv) {
                                  sparkinfer_server::ThinkingStreamSplitter splitter(enable_thinking, engine.is_museglimmer());
                                  sparkinfer_server::StopSequenceFilter stop_filter(stop);
                                  std::string tool_stop_text;  // raw accumulator, tool_protocol branch only
+                                 // tool_protocol only: the reasoning is streamed as it is generated, and only
+                                 // the answer and its tool calls wait for the complete output (see on_tok).
+                                 const bool stream_tool_reasoning = tool_protocol && enable_thinking &&
+                                                                    !chat_request.reasoning_exclude;
+                                 sparkinfer_server::ThinkingStreamSplitter tool_splitter(enable_thinking, engine.is_museglimmer());
+                                 sparkinfer_server::StopSequenceFilter tool_reasoning_stop(stop);
+                                 bool tool_reasoning_streamed = false;
                                  bool stopped_by_sequence = false;
                                  // Scoped out of tool-calling responses (buffered, no live content
                                  // emission at all -- see the DFlash-check comment above for the
@@ -1967,18 +1974,36 @@ int main(int argc, char** argv) {
                                      return lp;
                                  };
                                  auto on_tok = [&](int tid) -> bool {
-                                     // Tool-capable responses are intentionally buffered until the
-                                     // native Qwen XML is complete and schema-valid.
+                                     // Tool-capable responses buffer the answer until the native Qwen
+                                     // XML is complete and schema-valid. The reasoning before it is
+                                     // not tool markup, and streams as it is generated: buffered too,
+                                     // an agent saw nothing but heartbeats for the minutes a long
+                                     // thinking turn takes, then -- when that turn ran out of
+                                     // max_tokens -- an empty message (#1088).
                                      if (tool_protocol) {
-                                         if (stop.empty()) {
+                                         if (stop.empty() && !stream_tool_reasoning) {
                                              stream_ids.push_back(tid);
                                              return sink.is_writable();
                                          }
-                                         tool_stop_text += g_tokenizer.decode_delta(stream_ids, tid);
-                                         size_t pos;
-                                         if (find_stop_match(tool_stop_text, stop, pos)) {
-                                             stopped_by_sequence = true;
-                                             return false;
+                                         const std::string piece = g_tokenizer.decode_delta(stream_ids, tid);
+                                         if (!stop.empty()) {
+                                             tool_stop_text += piece;
+                                             size_t pos;
+                                             if (find_stop_match(tool_stop_text, stop, pos)) {
+                                                 stopped_by_sequence = true;
+                                                 return false;
+                                             }
+                                         }
+                                         if (stream_tool_reasoning) {
+                                             // The answer the splitter returns is ignored: it is
+                                             // emitted, parsed, once generation ends.
+                                             const auto delta = tool_splitter.feed(tool_reasoning_stop.feed(piece));
+                                             if (!delta.reasoning_content.empty()) {
+                                                 tool_reasoning_streamed = true;
+                                                 if (!write_stream_reasoning_delta(gs, cid, created,
+                                                                                   delta.reasoning_content, ci))
+                                                     return false;
+                                             }
                                          }
                                          return sink.is_writable();
                                      }
@@ -2100,6 +2125,17 @@ int main(int argc, char** argv) {
                                      out->generation_ms = outcome.generation_ms;
                                      out->decode_tps = outcome.decode_tps;
                                      out->ok = true;
+                                     if (tool_reasoning_streamed) {
+                                         // A turn that ended inside its reasoning still holds back a
+                                         // possible partial "</think>"; a stop match ends at the match.
+                                         if (!stopped_by_sequence) {
+                                             sparkinfer_server::ThinkingStreamSplitter::Delta tail;
+                                             tool_splitter.finish(tail);
+                                             write_stream_reasoning_delta(gs, cid, created, tail.reasoning_content, ci);
+                                         }
+                                         // Already on the wire; emitting it again would double it.
+                                         out->parsed.reasoning_content.clear();
+                                     }
                                      emit_buffered_output(ci, out->parsed, out->finish_reason);
                                      return;
                                  }
@@ -2522,9 +2558,16 @@ int main(int argc, char** argv) {
                              if (truncated) {
                                  log_truncated_output("tool-call", text);
                                  // Never expose a truncated native tag sequence. A length/stop end
-                                 // is a valid completion, so return an empty assistant result
-                                 // instead of a hard failure.
+                                 // is a valid completion, so return the turn's reasoning and nothing
+                                 // else instead of a hard failure. Dropping the reasoning as well
+                                 // handed a client that waited out a 16K-token turn an empty message
+                                 // with no sign of what the model had been doing (#1088).
+                                 std::string kept_reasoning;
+                                 if (!engine.is_museglimmer() && !chat_request.reasoning_exclude)
+                                     kept_reasoning = sparkinfer_server::parse_plain_assistant_output(
+                                         text, enable_thinking).reasoning_content;
                                  parsed = {};
+                                 parsed.reasoning_content = std::move(kept_reasoning);
                              } else {
                                  out.http_status = 502;
                                  out.fail = NonStreamBranchOutcome::Fail::invalid_tool_output;
