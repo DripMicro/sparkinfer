@@ -307,6 +307,7 @@ private:
     uint64_t next_wait_ticket_ = 1;
     std::atomic<uint64_t> admission_waits_{0}, admission_timeouts_{0};
     bool queue_depth_full_locked() const;
+    int active_jobs_locked() const;   // jobs not yet done; caller holds mu_
     std::atomic<uint64_t> next_req_id_{1};
     std::unique_ptr<PrefixCache> prefix_cache_;
     bool speculative_ = false;

@@ -152,9 +152,11 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
         // Every request reserves KV for its prompt plus max_tokens when it is admitted, so a few
         // agents asking for long outputs can hold the whole pool. Such a request used to be
         // rejected with 429 at once, which clients like prime-agent surface as a failed turn
-        // (#1088). It now waits for capacity, oldest first, woken whenever a job finishes (the worker
-        // notifies cv_). The queue-depth cap still rejects new arrivals at once, and a device
-        // out-of-memory or a bad request never waits.
+        // (#1088). It now waits for capacity, oldest first, woken whenever a job finishes or
+        // completes its prefill (the worker notifies cv_). A device allocation that fails while
+        // other requests run waits too: see alloc_wait below. The queue-depth cap still rejects
+        // new arrivals at once, and a bad request, or an allocation failure with nothing else
+        // running, never waits.
         const double wait_s = admission_wait_s_config();
         const double timeout_s = request_timeout_s_config();
         const double limit_s = timeout_s > 0 ? std::min(wait_s, timeout_s) : wait_s;
@@ -163,6 +165,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
                 std::chrono::duration<double>(limit_s));
         uint64_t ticket = 0;
         bool queued = false;
+        bool alloc_wait = false;
         for (;;) {
             const bool my_turn = limit_s <= 0 || waiting_.empty() ||
                                  (queued && *waiting_.begin() == ticket);
@@ -171,7 +174,15 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
                 job.req = req;
                 job.prefill_pos = req.prefill_start;
                 rid = submit_locked(std::move(job), on_token, on_token_logprob, &err);
-                if (rid || err != EnqueueError::OVERLOADED || limit_s <= 0 || !running_) break;
+                if (rid || limit_s <= 0 || !running_) break;
+                // A session allocation that fails while other requests run is capacity, not the
+                // card: their prefill scratch and session state come back as they progress. With
+                // concurrent 20K-token prompts on serve-dspark at --ctx 131072, every request
+                // arriving while one prefilled was refused as "device out of memory ... requires
+                // operator attention", and requests that would have fit a moment later failed
+                // (#1088). With nothing else running, it is the card, and still a 503.
+                alloc_wait = err == EnqueueError::ALLOC_FAILED && !device_lost() && active_jobs_locked() > 0;
+                if (err != EnqueueError::OVERLOADED && !alloc_wait) break;
             }
             if (!queued) {
                 if (queue_depth_full_locked()) { err = EnqueueError::OVERLOADED; break; }
@@ -180,7 +191,13 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::complete_streaming(
                 queued = true;
                 admission_waits_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            // Memory can also come back without a job finishing or completing its prefill (a
+            // speculative run's teardown, say), so an allocation wait retries every 2 s as well.
+            const auto wake = alloc_wait ? std::min(deadline, std::chrono::steady_clock::now() +
+                                                                  std::chrono::seconds(2))
+                                         : deadline;
+            if (cv_.wait_until(lock, wake) == std::cv_status::timeout &&
+                std::chrono::steady_clock::now() >= deadline) {
                 gave_up = true;
                 deadline_ran_out = timeout_s > 0 && timeout_s <= wait_s;
                 break;
@@ -245,13 +262,17 @@ uint64_t ContinuousBatchEngine::admission_timeouts() const {
     return admission_timeouts_.load(std::memory_order_relaxed);
 }
 
+int ContinuousBatchEngine::active_jobs_locked() const {
+    int active = 0;
+    for (const auto& kv : jobs_) if (!kv.second->done) active++;
+    return active;
+}
+
 // New arrivals only: a request already waiting is never pushed out by the cap it was admitted under.
 bool ContinuousBatchEngine::queue_depth_full_locked() const {
     const int cap = max_queue_depth_config();
     if (cap <= 0) return false;
-    int active = 0;
-    for (const auto& kv : jobs_) if (!kv.second->done) active++;
-    return active + (int)waiting_.size() >= cap;
+    return active_jobs_locked() + (int)waiting_.size() >= cap;
 }
 
 bool ContinuousBatchEngine::apply_constraint_mask(Job& job) {
@@ -977,6 +998,8 @@ bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
         if (!job.req.mrope_pos.empty()) model_->clear_pending_mrope();
         job.prefill_pos = out_pos;
         if (job.prefill_pos >= n) {
+            // The prefill's scratch memory is back: a request waiting on a failed allocation retries.
+            cv_.notify_all();
             // Known v1 scope limitation for temperature sampling (runtime/src/models/qwen35.cpp's
             // forward_token doc comment): ingest_prompt_range() is a single funnel shared by
             // cache_prefix()'s exclusive-session path and several other internal call sites, so
