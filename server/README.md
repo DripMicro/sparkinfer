@@ -61,11 +61,16 @@ For a source build, pass the downloaded drafter directory explicitly:
   -m models/Qwen3.8-27B-NVFP4-RTX5090 \
   --tokenizer models/Qwen3.8-27B-NVFP4-RTX5090/tokenizer.json \
   --draft-model models/Qwen3.8-27B-DSpark-NVFP4 \
-  --ctx 262144 --host 0.0.0.0 --port 8080
+  --ctx 131072 --host 0.0.0.0 --port 8080
 ```
 
-An explicitly requested drafter is a startup requirement: a missing or incompatible checkpoint
-terminates the server rather than quietly changing performance. DSpark is selected only for
+The KV pool is sized for the whole `--ctx` before the drafter loads. On a 32 GB card, 262,144 tokens
+leaves no device memory for the drafter, which is why this example and `serve-dspark` use
+131,072.
+
+An explicitly requested drafter is a startup requirement: a missing or incompatible checkpoint, or
+one that does not fit in device memory, terminates the server rather than quietly changing
+performance. DSpark is selected only for
 greedy, plain-text requests while they are the sole active request. Vision, sampling, penalties,
 logprobs, forced-token paths, prefix resumes, and requests that overlap another request stay on or
 hand off to lossless autoregressive decoding. `/metrics` exposes
@@ -517,7 +522,9 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_PREFIX_CACHE_MIN_TOKENS` | `1024` | Shortest prompt position a request checkpoints at. Shorter prompts still reuse cached prefixes but do not create one. |
 | `SPARKINFER_PREFILL_BATCHED` | `1` | Batched prefill in `cache_prefix` / cold prompts |
 | `SPARKINFER_DETERMINISTIC` | `0` | `1` = bit-reproducible output (see **Determinism** above). Decode speed unchanged; TTFT +2–8%. |
-| `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` | Per-request generation cap (independent of context length, which is checked separately against the live `--ctx`) |
+| `SPARKINFER_MAX_OUTPUT_TOKENS` | `4096` (container: `16384`) | Per-request generation cap. A request without `max_tokens` generates up to 256 tokens; a larger `max_tokens` is clamped to this cap. Each request reserves KV blocks for its prompt plus `max_tokens` when it is admitted, so a cap near the full context lets one long request hold the whole pool while other requests get `429`. |
+| `SPARKINFER_DRAFT_MODEL` | — | DSpark drafter directory, same as `--draft-model`. The server exits if the drafter cannot be loaded, including when it does not fit in device memory. |
+| `SPARKINFER_DSPARK_MAX_CTX` | `16384` | Context the DSpark drafter attends over (its own KV cache), capped at `--ctx`. |
 | `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on the total active continuous-batch set (running and waiting between scheduler steps). Beyond it, new requests are rejected as `429` before KV allocation. Production services that promise bounded admission should set this explicitly; `0` does not satisfy such a promise. |
 | `SPARKINFER_REQUEST_TIMEOUT_S` | `0` (disabled) | Per-request wall-clock deadline from submission to finish; exceeding it returns `504`. Left disabled by default — a cold 32k-context prefill alone has been measured taking ~90s of TTFT, so an aggressive default would misfire on legitimate long-context requests. |
 | `SPARKINFER_READ_TIMEOUT_S` / `SPARKINFER_WRITE_TIMEOUT_S` | `300` | Transport-level socket timeouts (httplib). Reset on each byte transferred, so a slow-but-progressing stream doesn't trip them. |
@@ -526,6 +533,21 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_PROMPT_TOKENS_PER_MINUTE` | — | Optional prompt-token/minute capacity published by `/v1/models`. |
 | `SPARKINFER_COMPLETION_TOKENS_PER_MINUTE` | — | Optional completion-token/minute capacity published by `/v1/models`. |
 | `SPARKINFER_OPENROUTER_PROVIDER` | `0` | `1` emits the strict, closed OpenRouter v2.4 model document. The OpenRouter launcher sets this automatically. |
+
+### Release container settings
+
+`ghcr.io/gittensor-ai-lab/sparkinfer-qwen38` reads the variables below as well as every variable
+above. Pass them with `-e NAME=value`. Server flags appended after the image name, or after
+`serve-dspark`, are added to the server command line and take precedence (`--ctx 65536`).
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CTX` | `262144`; `131072` with `serve-dspark` | Context length, passed as `--ctx` |
+| `SPARKINFER_MAX_OUTPUT_TOKENS` | `16384` | Per-request generation cap (see the table above) |
+| `MODEL_REPO` / `MODEL_DIR` | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` / `/models/qwen38-nvfp4` | Target checkpoint, downloaded on first run |
+| `DRAFT_REPO` / `DRAFT_DIR` | `gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4` / `/models/qwen38-dspark` | DSpark drafter, used by `serve-dspark` |
+| `MODEL_NAME` | `qwen38-nvfp4` | Model id the API advertises |
+| `HOST` / `PORT` | `0.0.0.0` / `8080` | Listen address inside the container |
 
 ### Concurrency diagnostic
 

@@ -30,7 +30,8 @@ docker run --gpus all -p 8080:8080 -v qwen38:/models \
 The first run downloads both the target and
 [`gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4)
 into the named volume. Startup fails instead of silently serving autoregressively if the drafter
-cannot be loaded. Greedy, plain-text, single-active-request generations use DSpark; requests with
+cannot be loaded. It serves a 131,072-token context rather than 262,144: on a 32 GB card the
+full-context KV pool leaves no device memory for the drafter. Greedy, plain-text, single-active-request generations use DSpark; requests with
 vision, sampling, penalties, logprobs, or an overlapping concurrent request use the lossless
 autoregressive path. Inspect `sparkinfer_speculative_runs_total` at `/metrics` to verify use.
 
@@ -43,6 +44,21 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 Serves text, **images and video**. ~1 GB image, Blackwell (`sm_120`) only.
 Build from source instead: [Quickstart](#quickstart).
+
+**What the endpoint serves**
+
+- **Model id** `qwen38-nvfp4`. `GET /v1/info` reports the live limits.
+- **Context** 262,144 tokens, or 131,072 with `serve-dspark`. **Output** up to 16,384 tokens per
+  request.
+- **Inputs** text, images and video, function tools, `response_format` JSON output, and reasoning on
+  or off.
+- **APIs** OpenAI (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`), Anthropic
+  (`/v1/messages`), Ollama (`/api/chat`, `/api/generate`) and LM Studio (`/api/v0/...`).
+
+Change settings with `-e`, for example `-e CTX=65536 -e SPARKINFER_MAX_OUTPUT_TOKENS=32768`, or append
+server flags such as `--ctx 65536` after the image name or after `serve-dspark`. See
+[container settings](server/README.md#release-container-settings) and
+[all server parameters](server/README.md#env).
 
 Provenance is attested to the image digest:
 
