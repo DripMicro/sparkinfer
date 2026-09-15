@@ -3338,22 +3338,39 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
     Impl& s = *p_;
     const int n = end - start;
     const int window = prefill_window_tokens();
+    int done = 0;
+    auto run = [&](int step) -> int {
+        for (int pos = start + done; pos < end; pos += step) {
+            const int len = std::min(step, end - pos);
+            const bool last = (pos + len >= end);
+            const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
+            if (seed < 0) return -1;
+            if (last) {
+                if (seed >= s.cfg.vocab) return -1;
+                done = n;
+                return seed;
+            }
+            done = pos + len - start;
+        }
+        return -1;
+    };
     // Same split as prefill_batched_chunked: one pass up to the single-pass threshold, windows
     // above it. Every pass here has pos0 > 0, so each runs eager and carries the recurrence forward.
-    const int step = (window <= 0 || n <= prefill_single_pass_max_tokens()) ? n : window;
-    for (int pos = start; pos < end; pos += step) {
-        const int len = std::min(step, end - pos);
-        const bool last = (pos + len >= end);
-        const int seed = prefill_batched(prompt_ids + pos, len, want_seed_logprob && last, pos);
-        if (seed < 0) return -1;
-        if (last) {
-            if (seed >= s.cfg.vocab) return -1;
-            if (out_done) *out_done = n;
-            return seed;
-        }
-        if (out_done) *out_done = pos + len - start;
+    const bool single = window <= 0 || n <= prefill_single_pass_max_tokens();
+    int seed = run(single ? n : window);
+    // ...and the same retry when the single pass declines. A cached prefix followed by a long
+    // continuation is what an agent sends after a large tool result, and on serve-dspark at
+    // --ctx 131072 the 31K-token pass's scratch arena did not fit (free=31 MB): the WHOLE
+    // continuation went to the token loop, minutes instead of seconds (#1088). A pass declines
+    // before its first kernel runs -- see the pos0 != 0 note in prefill_batched_run -- so
+    // nothing of it landed, and windowing from `start` continues the same state.
+    if (seed < 0 && single && done == 0 && window > 0 && n > window) {
+        fprintf(stderr, "[prefill] resumed single pass declined at n=%d -- windowing (%d) instead "
+                        "of the token loop\n", n, window);
+        seed = run(window);
     }
-    return -1;
+    if (out_done) *out_done = done;
+    return seed;
 }
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {
