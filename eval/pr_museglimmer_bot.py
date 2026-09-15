@@ -2011,6 +2011,19 @@ def main():
         if not args.reeval and head and head in museglimmer_evaluated_commits(args.repo, num):
             print(f"PR #{num} @ {short}: already museglimmer-evaluated — skip")
             continue
+        # Did the author declare a DIFFERENT target model (#1027)? Checked before any GPU time.
+        #
+        # This bot used to evaluate every PR regardless, because no other bot guards Muse Glimmer.
+        # That cost a real PR: #1082 declared Qwen3.8-27B only and claimed +35% at cb-decode@c32 on
+        # the unsloth checkpoint -- an axis pr_qwen38_bot.py scores -- and this bot scored it
+        # eval-museglimmer:none and auto-closed it before the Qwen3.8 bot polled it. Explicit
+        # decision 2026-09-15: skip such PRs. The cost is that a PR declared for Qwen3.8 alone is
+        # no longer checked against Muse Glimmer by any bot. arb.model_skip_reason() fails open:
+        # an absent, ambiguous or "shared" declaration still evaluates here.
+        skip_why = arb.model_skip_reason(pr.get("body") or "", "muse")
+        if skip_why:
+            print(f"PR #{num}: {skip_why} — skip museglimmer eval")
+            continue
         if arb.pr_merge_conflict(pr.get("mergeable")):
             print(f"PR #{num}: merge conflict — museglimmer-needs-rebase")
             if not args.dry_run:

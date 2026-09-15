@@ -1019,6 +1019,10 @@ def rtx5090_should_close(body, areas=None):
 #
 # Skipping is only safe where some OTHER bot still guards the skipped model against regressions --
 # shared code means a change aimed at one model can break another. See model_skip_reason().
+#
+# Exception, by explicit decision 2026-09-15: the Muse bot skips PRs declared for Qwen3.8 alone even
+# though no bot guards Muse Glimmer against them. It had auto-closed #1082, a Qwen3.8-only PR,
+# before the Qwen3.8 bot that measures its axis could score it.
 MODEL_KEYS = {
     "muse":    ("muse",),                       # Muse Glimmer
     "qwen38":  ("qwen3.8", "qwen38", "dspark", "modelopt"),

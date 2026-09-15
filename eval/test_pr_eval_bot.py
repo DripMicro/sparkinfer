@@ -1225,5 +1225,28 @@ class DeclaredTargetModelTest(unittest.TestCase):
 
 
 
+class MuseBotHonoursDeclaredModelTests(unittest.TestCase):
+    """#1082 declared Qwen3.8-27B only, and the Muse Glimmer bot evaluated and auto-closed it
+    before the Qwen3.8 bot that scores its axis could poll it."""
+
+    QWEN38_ONLY = (
+        "**Target model(s)**\n\n"
+        "- [ ] **Muse Glimmer**\n"
+        "- [x] **Qwen3.8-27B** (ModelOpt NVFP4 / DSpark)\n"
+        "- [ ] **Shared / both**\n"
+    )
+
+    def test_a_qwen38_only_pr_is_skipped_for_muse(self):
+        self.assertTrue(bot.model_skip_reason(self.QWEN38_ONLY, "muse"))
+        self.assertIsNone(bot.model_skip_reason(self.QWEN38_ONLY, "qwen38"))
+
+    def test_the_muse_bot_checks_the_declaration_before_evaluating(self):
+        import inspect
+        import pr_museglimmer_bot as muse
+        src = inspect.getsource(muse.main)
+        self.assertIn('arb.model_skip_reason(pr.get("body") or "", "muse")', src)
+        # Before the greenlight, i.e. before any PR is queued for GPU time.
+        self.assertLess(src.index("model_skip_reason"), src.index("greenlight_status"))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

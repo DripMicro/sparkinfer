@@ -3209,8 +3209,9 @@ def main():
         #
         # Safe to skip here specifically because the Muse bot runs BOTH a ModelOpt (Qwen3.8) and a
         # Qwen3.6 guard on every PR it scores, so a Muse-declared PR is still regression-checked
-        # against this bot's models. The reverse is NOT true (nothing guards Muse Glimmer from this
-        # bot's side), which is why pr_museglimmer_bot.py deliberately does not do this.
+        # against this bot's models. The reverse is NOT true: nothing guards Muse Glimmer from this
+        # bot's side. pr_museglimmer_bot.py skipped nothing for that reason until 2026-09-15, when it
+        # auto-closed a Qwen3.8-only PR (#1082) and was changed to skip as well, accepting that gap.
         skip_why = arb.model_skip_reason(pr.get("body") or "", "qwen38")
         if skip_why:
             print(f"PR #{num}: {skip_why} — skip dspark eval (guarded by the Muse bot's "
