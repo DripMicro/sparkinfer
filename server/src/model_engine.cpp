@@ -1077,6 +1077,7 @@ CompletionResult ModelEngine::complete_streaming(const std::vector<int>& prompt_
     out.alloc_failed = result.alloc_failed;
     out.timed_out = result.timed_out;
     out.cancelled = result.cancelled;
+    out.internal_error = result.internal_error;
     out.reached_token_limit = result.reached_token_limit;
     out.ttft_ms = result.ttft_ms;
     out.generation_ms = result.generation_ms;

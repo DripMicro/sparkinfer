@@ -30,6 +30,7 @@ struct CompletionResult {
                                  // 503 (permanent until restart), never 429 (implies transient/retry)
     bool timed_out = false;   // true => a per-request deadline was exceeded
     bool cancelled = false;   // true => on_token returned false; not an error
+    bool internal_error = false;  // true => the engine failed the request itself -- caller returns 500
     bool reached_token_limit = false;  // true => max_new_tokens, not EOS, ended generation
     double ttft_ms = -1.0;
     double generation_ms = -1.0;

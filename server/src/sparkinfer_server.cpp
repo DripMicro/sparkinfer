@@ -1451,6 +1451,9 @@ int main(int argc, char** argv) {
             } else if (outcome.alloc_failed) {
                 g_requests_server_error++;
                 fail(503, outcome.error);
+            } else if (outcome.internal_error) {
+                g_requests_server_error++;
+                fail(500, outcome.error);
             } else if (outcome.timed_out) {
                 g_requests_timeout++;
                 fail(504, outcome.error);
@@ -1710,6 +1713,7 @@ int main(int argc, char** argv) {
                      if (o.overloaded)   return 429;
                      if (o.alloc_failed) return 503;
                      if (o.timed_out)    return 504;
+                     if (o.internal_error) return 500;
                      return 400;
                  };
 
@@ -2768,6 +2772,7 @@ int main(int argc, char** argv) {
                      if (o.overloaded)   return 429;
                      if (o.alloc_failed) return 503;
                      if (o.timed_out)    return 504;
+                     if (o.internal_error) return 500;
                      return 400;
                  };
 

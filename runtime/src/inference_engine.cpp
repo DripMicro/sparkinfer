@@ -89,6 +89,7 @@ struct ContinuousBatchEngine::Job {
     bool overloaded = false;
     bool timed_out = false;
     bool cancelled = false;
+    bool internal_error = false;
     bool reached_token_limit = false;
 
     std::chrono::steady_clock::time_point t_submit{};
@@ -379,6 +380,7 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     if (r.failed || r.emitted != job.decode_emitted ||
         (!r.finished && !hit_eos && !hit_limit && r.position != prompt_len + job.decode_emitted)) {
         job.error = "speculative decode failed; the request was aborted";
+        job.internal_error = true;
         finish();
         return;
     }
@@ -538,6 +540,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
     out.overloaded = it->second->overloaded;
     out.timed_out = it->second->timed_out;
     out.cancelled = it->second->cancelled;
+    out.internal_error = it->second->internal_error;
     out.reached_token_limit = it->second->reached_token_limit;
     out.ttft_ms = it->second->ttft_ms;
     out.generation_ms = it->second->generation_ms;

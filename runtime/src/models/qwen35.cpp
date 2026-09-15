@@ -4155,9 +4155,14 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         capture_start = (int)prompt.size() - 4096;
     }
     if (hooks) {
-        // The draft's KV holds the captured window plus everything generated. Past its max_seq
-        // forward_block fails mid-generation, so do not start what cannot finish.
-        const long draft_need = (long)((int)prompt.size() - capture_start) + max_new + 2L * (B + 1);
+        // Past its max_seq the draft's forward_block fails mid-generation, so do not start what
+        // cannot finish. The bound is on ABSOLUTE positions, the whole prompt plus everything
+        // generated: forward_block checks the context end, not the size of the captured window.
+        // Checking only the window let a prompt longer than the draft context through, so the
+        // first draft step failed and the request was aborted with "speculative decode failed"
+        // (#1088: every greedy plain-text request over ~16K tokens on serve-dspark). Such a
+        // request stays on ordinary decode.
+        const long draft_need = (long)prompt.size() + max_new + 2L * (B + 1);
         if (draft_need > dc.max_seq) return out;
     }
     // Engine-driven: requests are admitted concurrently, and admission allocates KV and opens

@@ -190,6 +190,9 @@ public:
         bool timed_out = false;
         // true => on_token returned false (client went away mid-stream); not an error.
         bool cancelled = false;
+        // true => the engine itself failed the request (a speculative run that could not finish):
+        // report a server error, not a client one.
+        bool internal_error = false;
         // true => generation exhausted max_new_tokens instead of reaching an EOS token.
         // HTTP callers surface this as finish_reason="length"; in particular, a truncated
         // tool-call payload must never be reported as a successful "stop".
