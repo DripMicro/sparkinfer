@@ -14,6 +14,7 @@ namespace {
 using nlohmann::json;
 using sparkinfer_server::ChatRequest;
 using sparkinfer_server::ParsedToolOutput;
+using sparkinfer_server::PlainAssistantOutput;
 using sparkinfer_server::ResponseFormat;
 using sparkinfer_server::ResponseFormatType;
 using sparkinfer_server::ToolChoiceMode;
@@ -23,6 +24,7 @@ using sparkinfer_server::apply_qwen36_tools_template;
 using sparkinfer_server::forced_tool_call_prefix;
 using sparkinfer_server::parse_chat_request_json;
 using sparkinfer_server::parse_legacy_completion_request;
+using sparkinfer_server::parse_plain_assistant_output;
 using sparkinfer_server::parse_qwen36_tool_output;
 using sparkinfer_server::parse_request_controls;
 using sparkinfer_server::parse_score_request;
