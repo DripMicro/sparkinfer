@@ -802,6 +802,21 @@ int ModelEngine::active_requests() const {
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_active() : 0;
 }
 
+int ModelEngine::waiting_requests() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_waiting() : 0;
+}
+
+uint64_t ModelEngine::admission_waits() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->admission_waits() : 0;
+}
+
+uint64_t ModelEngine::admission_timeouts() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->admission_timeouts() : 0;
+}
+
 int ModelEngine::free_kv_blocks() const {
     std::lock_guard<std::mutex> lock(mu_);
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->num_free_kv_blocks() : 0;

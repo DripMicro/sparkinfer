@@ -1111,6 +1111,7 @@ int main(int argc, char** argv) {
         std::ostringstream body;
         const int cap = engine.max_queue_depth();
         body << "{\"active_requests\":" << engine.active_requests()
+             << ",\"waiting_requests\":" << engine.waiting_requests()
              << ",\"free_kv_blocks\":" << engine.free_kv_blocks()
              << ",\"max_queue_depth\":" << cap
              << ",\"accepting_requests\":" << (g_shutdown_requested.load() ? "false" : "true") << "}";
@@ -1164,6 +1165,15 @@ int main(int argc, char** argv) {
                 "# HELP sparkinfer_active_requests In-flight requests\n"
                 "# TYPE sparkinfer_active_requests gauge\n"
              << "sparkinfer_active_requests " << engine.active_requests() << "\n"
+                "# HELP sparkinfer_waiting_requests Requests waiting for KV capacity\n"
+                "# TYPE sparkinfer_waiting_requests gauge\n"
+             << "sparkinfer_waiting_requests " << engine.waiting_requests() << "\n"
+                "# HELP sparkinfer_admission_waits_total Requests that waited for KV capacity\n"
+                "# TYPE sparkinfer_admission_waits_total counter\n"
+             << "sparkinfer_admission_waits_total " << engine.admission_waits() << "\n"
+                "# HELP sparkinfer_admission_wait_timeouts_total Requests rejected after waiting for capacity\n"
+                "# TYPE sparkinfer_admission_wait_timeouts_total counter\n"
+             << "sparkinfer_admission_wait_timeouts_total " << engine.admission_timeouts() << "\n"
                 "# HELP sparkinfer_free_kv_blocks Free KV cache blocks\n"
                 "# TYPE sparkinfer_free_kv_blocks gauge\n"
              << "sparkinfer_free_kv_blocks " << engine.free_kv_blocks() << "\n";

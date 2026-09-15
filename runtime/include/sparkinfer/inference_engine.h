@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -225,6 +226,11 @@ public:
                                   on_token_logprob = nullptr);
 
     int num_active() const;
+    // Admission queue (#1088): requests waiting for KV capacity, how many ever waited, and how many
+    // gave up after SPARKINFER_ADMISSION_WAIT_S.
+    int num_waiting() const;
+    uint64_t admission_waits() const;
+    uint64_t admission_timeouts() const;
 
     // Vision tower used by step_job when a request carries images. Both non-owning and expected
     // to outlive the engine (ModelEngine owns them). Never set => a request with images is
@@ -292,6 +298,12 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::unordered_map<uint64_t, std::unique_ptr<Job>> jobs_;
+    // Tickets of requests waiting for KV capacity, oldest first; guarded by mu_. Only the oldest
+    // retries admission, so a large request is not starved by smaller ones arriving after it.
+    std::set<uint64_t> waiting_;
+    uint64_t next_wait_ticket_ = 1;
+    std::atomic<uint64_t> admission_waits_{0}, admission_timeouts_{0};
+    bool queue_depth_full_locked() const;
     std::atomic<uint64_t> next_req_id_{1};
     std::unique_ptr<PrefixCache> prefix_cache_;
     bool speculative_ = false;

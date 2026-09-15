@@ -223,6 +223,9 @@ public:
 
     // Live occupancy, for capacity-reporting endpoints. 0/0 if the model isn't loaded yet.
     int active_requests() const;
+    int waiting_requests() const;
+    uint64_t admission_waits() const;
+    uint64_t admission_timeouts() const;
     int free_kv_blocks() const;
     int max_queue_depth() const;
 
