@@ -26,7 +26,12 @@ if [ "${1:-}" = "serve-dspark" ]; then
   shift
   fetch "$DRAFT_REPO" "$DRAFT_DIR" "DSpark drafter"
   export SPARKINFER_DRAFT_MODEL="$DRAFT_DIR"
+  # The drafter needs device memory the full 262,144-token KV pool leaves no room for on a 32 GB
+  # card (#1086), so DSpark defaults to half the context. -e CTX=... (or --ctx) still overrides.
+  CTX="${CTX:-131072}"
 fi
+# Autoregressive serving fits the model's full context on one 32 GB card.
+CTX="${CTX:-262144}"
 
 fetch "$MODEL_REPO" "$MODEL_DIR" "target"
 MODE="autoregressive"

@@ -827,7 +827,12 @@ bool ModelEngine::load_draft(const std::string& dir, std::string& err) {
     dcfg.max_seq = std::min(impl_->cfg.max_seq, e ? std::max(1024, atoi(e)) : 16384);
     auto draft = std::make_unique<sparkinfer::DFlashDraftModel>(dcfg);
     if (!draft->load(dir)) {
-        err = "cannot load a DSpark draft from " + dir;
+        // The usual cause is device memory, not the checkpoint: the target's KV pool is sized for
+        // the whole --ctx before the draft loads, and at --ctx 262144 a 32 GB card has no room
+        // left for it (#1086).
+        err = "cannot load a DSpark draft from " + dir + " at --ctx " +
+              std::to_string(impl_->cfg.max_seq) +
+              " -- if the log above shows CUDA out-of-memory errors, lower --ctx (131072 fits a 32 GB card)";
         return false;
     }
     impl_->model->set_dflash_draft(draft.get());

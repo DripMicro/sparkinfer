@@ -33,8 +33,16 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
+// Every CUDA call cu() has seen fail, over the life of the process. load() and load_gguf() compare
+// it across the load: a draft whose weights or scratch did not fit has NOT loaded, however much of
+// it did. Without this the loader logged "malloc: out of memory" (and then a lost context), still
+// returned true, and the server started with speculative decoding advertised and every request
+// failing (#1086).
+std::atomic<int> g_cu_errors{0};
+
 inline void cu(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return;
+    g_cu_errors.fetch_add(1, std::memory_order_relaxed);
     // See device_health.h: sticky errors kill the context, so record them and let the
     // engine refuse work rather than issuing more against a dead device.
     const bool fatal = note_cuda_error(e);
@@ -707,6 +715,7 @@ static void compute_yarn_inv_freq(const DFlashDraftConfig& cfg, std::vector<floa
 
 bool DFlashDraftModel::load(const std::string& dir) {
     Impl& s = *p_;
+    const int cu_errors_before = g_cu_errors.load();
     const std::string cfg_path = dir + "/config.json";
     const std::string st_path = dir + "/model.safetensors";
     parse_config_json(cfg_path, s.cfg);
@@ -887,6 +896,11 @@ bool DFlashDraftModel::load(const std::string& dir) {
 
     // Scratch + KV cache (shared with load_gguf(), see Impl::alloc_scratch).
     s.alloc_scratch();
+    if (const int n = g_cu_errors.load() - cu_errors_before; n > 0) {
+        fprintf(stderr, "[dflash] draft NOT loaded: %d CUDA call(s) failed while uploading weights or "
+                        "allocating scratch (see above) -- usually device out of memory\n", n);
+        return false;
+    }
     fprintf(stderr, "[dflash] loaded draft: layers=%d H=%d B=%d n_cap=%d mask=%d markov_rank=%d "
                     "confidence=%d\n",
             s.cfg.n_layers, H, B, n_cap, s.cfg.mask_token_id, s.markov_rank, s.confidence_w != nullptr);
@@ -907,6 +921,7 @@ bool dflash_gguf_dequant_supported(int ggml_type) {
 
 bool DFlashDraftModel::load_gguf(const std::string& path) {
     Impl& s = *p_;
+    const int cu_errors_before = g_cu_errors.load();
     GGUF g;
     if (!g.open(path)) {
         fprintf(stderr, "[dflash] failed to open gguf %s\n", path.c_str());
@@ -992,6 +1007,11 @@ bool DFlashDraftModel::load_gguf(const std::string& path) {
     }
 
     s.alloc_scratch();
+    if (const int n = g_cu_errors.load() - cu_errors_before; n > 0) {
+        fprintf(stderr, "[dflash] draft NOT loaded: %d CUDA call(s) failed while uploading weights or "
+                        "allocating scratch (see above) -- usually device out of memory\n", n);
+        return false;
+    }
     fprintf(stderr,
             "[dflash] loaded draft (gguf): layers=%d H=%d B=%d n_cap=%d mask=%d rope_normal=%d\n",
             s.cfg.n_layers, H, s.cfg.block_size, n_cap, s.cfg.mask_token_id,
