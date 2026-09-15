@@ -1490,9 +1490,13 @@ int main(int argc, char** argv) {
                  const bool stream = controls.stream;
                  if (stream) g_requests_streaming++;
                  const bool enable_thinking = sparkinfer_server::parse_enable_thinking(req.body, engine.is_qwen38());
-                 int max_tokens = controls.max_tokens;
-                 if (max_tokens <= 0) max_tokens = 256;
-                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
+                 // Without max_tokens, generate until the model stops, up to the output cap and the
+                 // room the prompt leaves in the context (fitted once the prompt is tokenized). That
+                 // is what an OpenAI client that omits it expects, and what llama.cpp does. It was
+                 // 256, which cut agents' long answers and tool calls off mid-output (#1088).
+                 const bool max_tokens_set = controls.max_tokens > 0;
+                 int max_tokens = max_tokens_set ? std::min(controls.max_tokens, max_output_tokens())
+                                                 : max_output_tokens();
 
                  std::vector<int> prompt_ids;
                  sparkinfer_server::ChatRequest chat_request;
@@ -1600,6 +1604,8 @@ int main(int argc, char** argv) {
                  // rejects tools + response_format together at request time.
                  const bool json_mode_active =
                      chat_request.response_format.type != sparkinfer_server::ResponseFormatType::kText;
+                 if (!max_tokens_set)
+                     max_tokens = std::max(1, std::min(max_tokens, engine.max_seq() - (int)prompt_ids.size()));
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
@@ -1637,7 +1643,7 @@ int main(int argc, char** argv) {
                      res.set_chunked_content_provider(
                          stream_dialect_of(req) == StreamDialect::OllamaNdjson
                              ? "application/x-ndjson" : "text/event-stream",
-                         [&engine, prompt_ids, max_tokens, cid, created, enable_thinking,
+                         [&engine, prompt_ids, max_tokens, max_tokens_set, cid, created, enable_thinking,
                           // BY VALUE, like prompt_ids beside it: this provider runs after the
                           // handler returns, so a reference would dangle. Cheap -- PreparedImages
                           // shares its pixel buffers rather than owning them.
@@ -1755,7 +1761,10 @@ int main(int argc, char** argv) {
                                  bool ok = false;
                                  std::string validation_err;
                                  for (int attempt = 1; attempt <= 2; ++attempt) {
-                                     if ((int)cur_prompt_ids.size() + max_tokens > engine.max_seq()) {
+                                     // Without max_tokens, re-fit the budget to this attempt's prompt, which grows on a retry.
+                                     const int attempt_max = max_tokens_set ? max_tokens
+                                         : std::max(1, std::min(max_tokens, engine.max_seq() - (int)cur_prompt_ids.size()));
+                                     if ((int)cur_prompt_ids.size() + attempt_max > engine.max_seq()) {
                                          validation_err = "retry prompt exceeds server context";
                                          break;
                                      }
@@ -1775,7 +1784,7 @@ int main(int argc, char** argv) {
                                          }
                                          return sink.is_writable();
                                      };
-                                     outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
+                                     outcome = engine.complete_streaming(cur_prompt_ids, attempt_max, on_tok,
                                          temperature, branch_seed, top_k, top_p, presence_penalty,
                                          frequency_penalty, logit_bias, false, 0, nullptr, {},
                                          &cur_images,
@@ -2237,7 +2246,10 @@ int main(int argc, char** argv) {
                          bool ok = false;
                          std::string validation_err;
                          for (int attempt = 1; attempt <= 2; ++attempt) {
-                             if ((int)cur_prompt_ids.size() + max_tokens > engine.max_seq()) {
+                             // Without max_tokens, re-fit the budget to this attempt's prompt, which grows on a retry.
+                             const int attempt_max = max_tokens_set ? max_tokens
+                                 : std::max(1, std::min(max_tokens, engine.max_seq() - (int)cur_prompt_ids.size()));
+                             if ((int)cur_prompt_ids.size() + attempt_max > engine.max_seq()) {
                                  validation_err = "retry prompt exceeds server context";
                                  break;
                              }
@@ -2257,7 +2269,7 @@ int main(int argc, char** argv) {
                                  }
                                  return true;
                              };
-                             outcome = engine.complete_streaming(cur_prompt_ids, max_tokens, on_tok,
+                             outcome = engine.complete_streaming(cur_prompt_ids, attempt_max, on_tok,
                                  controls.temperature, branch_seed, controls.top_k, controls.top_p,
                                  controls.presence_penalty, controls.frequency_penalty, controls.logit_bias,
                                  false, 0, nullptr, {}, &cur_images,
@@ -2642,9 +2654,13 @@ int main(int argc, char** argv) {
                  }
                  const bool stream = controls.stream;
                  if (stream) g_requests_streaming++;
-                 int max_tokens = controls.max_tokens;
-                 if (max_tokens <= 0) max_tokens = 256;
-                 if (max_tokens > max_output_tokens()) max_tokens = max_output_tokens();
+                 // Without max_tokens, generate until the model stops, up to the output cap and the
+                 // room the prompt leaves in the context (fitted once the prompt is tokenized). That
+                 // is what an OpenAI client that omits it expects, and what llama.cpp does. It was
+                 // 256, which cut agents' long answers and tool calls off mid-output (#1088).
+                 const bool max_tokens_set = controls.max_tokens > 0;
+                 int max_tokens = max_tokens_set ? std::min(controls.max_tokens, max_output_tokens())
+                                                 : max_output_tokens();
 
                  const std::vector<int> prompt_ids = g_tokenizer.encode_raw(prompt);
                  if (prompt_ids.empty()) {
@@ -2654,6 +2670,8 @@ int main(int argc, char** argv) {
                                      "application/json");
                      return;
                  }
+                 if (!max_tokens_set)
+                     max_tokens = std::max(1, std::min(max_tokens, engine.max_seq() - (int)prompt_ids.size()));
                  if ((int)prompt_ids.size() + max_tokens > engine.max_seq()) {
                      g_requests_client_error++;
                      res.status = 400;
