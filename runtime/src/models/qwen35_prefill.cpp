@@ -184,7 +184,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (pos0 == 0 && s.lin_state && s.lin_conv_state) {
         pf_cu(cudaMemsetAsync(
                   s.lin_state, 0,
-                  (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim *
+                  (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim *
                       c.linear_head_dim * sizeof(float),
                   st),
               "linear state reset");
@@ -1711,7 +1711,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                       cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
             kernels::launch_prefill_gdn_conv(b8, w.ssm_conv, conv_state, gq, gk, gv,
                 N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, eps, st, cconv);
-            float* layer_state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            float* layer_state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
             // A pass that does not start at position 0 continues the recurrence already in `state`
             // (the state reset above runs only for pos0 == 0); the scan must load it, not zero it.
             kernels::launch_prefill_gdn_scan(gq, gk, gv, la, lb, w.ssm_dt, w.ssm_a,
@@ -4269,7 +4269,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             }
             if (!supported) break;
             const size_t conv_off = (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-            const size_t state_off = (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            const size_t state_off = (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
             if (packed) {
                 // Rows are independent sequences, so this is the ordinary AR decode step done B
                 // ways -- each row against its OWN conv window and recurrent state, mutating them
@@ -5041,10 +5041,17 @@ verify_forward_done:
     if (commit_layers && gdn_tbl_key != &s.w) {
         std::vector<int> ids;
         std::vector<dflash_kernels::GdnCommitLayer> wts;
+        bool slots_ok = true;
         for (int L = 0; L < c.n_layers; ++L) if (s.w.layers[L].linear_attn) {
+            const int slot = gdn_state_slot(c, L);
+            if (slot < 0 || slot >= gdn_state_slots(c)) slots_ok = false;
             ids.push_back(L);
-            wts.push_back({s.w.layers[L].ssm_dt, s.w.layers[L].ssm_a, L});
+            wts.push_back({s.w.layers[L].ssm_dt, s.w.layers[L].ssm_a, L, slot});
         }
+        // A slot outside the packed state would write past it. That cannot happen while
+        // linear_attn is is_linear_layer() (both loaders assign it that way), but if the two ever
+        // diverge, decline the batched commit and let the per-layer loop below carry the round.
+        if (!slots_ok) { ids.clear(); wts.clear(); }
         if (d_gdn_layers) cudaFree(d_gdn_layers);
         if (d_gdn_w) cudaFree(d_gdn_w);
         d_gdn_layers = nullptr; d_gdn_w = nullptr; n_gdn = 0;
@@ -5077,7 +5084,7 @@ verify_forward_done:
             bf16* rb = rec_b + (size_t)L * N * vh;
             bf16* conv_live = static_cast<bf16*>(s.lin_conv_state) +
                 (size_t)L * (c.linear_conv_kernel - 1) * lqkv;
-            float* state = s.lin_state + (size_t)L * vh * c.linear_head_dim * c.linear_head_dim;
+            float* state = s.lin_state + (size_t)gdn_state_slot(c, L) * vh * c.linear_head_dim * c.linear_head_dim;
             kernels::launch_dflash_gdn_conv_commit(rq, conv_live, keep, c.linear_q_heads, vh,
                 c.linear_head_dim, c.linear_conv_kernel, st);
             kernels::launch_dflash_gdn_scan_commit(rk, rv, ra, rb, s.w.layers[L].ssm_dt,

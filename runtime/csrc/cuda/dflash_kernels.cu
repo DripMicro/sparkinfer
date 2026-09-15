@@ -1882,7 +1882,7 @@ __global__ void k_gdn_scan_commit_layers(
     const bf16* beta = beta_base + ab_stride * L;
     const bf16* dt = reinterpret_cast<const bf16*>(layers[li].dt);
     const bf16* a = reinterpret_cast<const bf16*>(layers[li].a);
-    float* live_state = live_base + live_stride * L;
+    float* live_state = live_base + live_stride * (size_t)layers[li].state_slot;
 
     // Must match df_gdn_scan_checkpoint_kernel's qh mapping exactly (batched_prefill.cu) -- this
     // used to hardcode vh % q_heads unconditionally, silently using the wrong K/Q head for every

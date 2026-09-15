@@ -163,7 +163,11 @@ void launch_rms_heads_rope_normal(void* x, const void* w, int seq, int n_heads, 
 // wrong from the day the optimization was written -- k_gdn_scan_commit_layers hardcoded the
 // vh % q_heads mapping and silently dropped the vh / (v_heads/q_heads) branch checkpoint kernels
 // use for qh_block models like Qwen3.8-27B).
-struct GdnCommitLayer { const void* dt; const void* a; int layer; };
+// `layer` addresses the per-layer RECORD buffers (k/v/alpha/beta, n_layers-strided); `state_slot`
+// addresses the recurrent state, which is packed one slot per linear-attention layer
+// (gdn_state_slot in qwen35_prefill.h). The two differ on every layer after the first
+// full-attention layer, so the kernel must not use one for the other.
+struct GdnCommitLayer { const void* dt; const void* a; int layer; int state_slot; };
 
 void launch_gdn_conv_commit_layers(const void* qkv_base, size_t qkv_layer_stride,
                                    void* live_base, size_t live_layer_stride,

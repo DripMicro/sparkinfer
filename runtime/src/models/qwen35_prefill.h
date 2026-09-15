@@ -12,6 +12,25 @@
 
 namespace sparkinfer {
 
+// Gated-DeltaNet recurrent state is held for the LINEAR-ATTENTION layers only, packed one slot per
+// such layer. It used to be sized and indexed by n_layers, so every full-attention layer carried a
+// head_dim^2 * v_heads block of state it never reads: on Qwen3.8-27B that is 16 of 64 layers, 25% of
+// each session's largest buffer -- ~50 MB a session, ~1.65 GB across 33 concurrent requests, which
+// is the margin between a 32-row packed step fitting in 32 GB and running out of it.
+//
+// The layer rule is is_linear_layer()'s: a layer is linear unless (L+1) % full_attn_interval == 0.
+// A linear layer's slot is therefore L minus the attention layers before it, L - L/interval, and a
+// stack of n layers holds n - n/interval slots. With no interval (a stack that has no linear layers,
+// or one gated back to the flag) both fall back to the layer index, i.e. exactly the old layout.
+inline int gdn_state_slots(const Qwen35Config& c) {
+    if (!c.hybrid || c.full_attn_interval <= 0) return c.n_layers;
+    return c.n_layers - c.n_layers / c.full_attn_interval;
+}
+inline int gdn_state_slot(const Qwen35Config& c, int layer) {
+    if (!c.hybrid || c.full_attn_interval <= 0) return layer;
+    return layer - layer / c.full_attn_interval;
+}
+
 struct Qwen35PrefillCtx {
     const Qwen35Config&  cfg;
     const Qwen35Weights& w;
