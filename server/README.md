@@ -393,9 +393,14 @@ avoid such unions when JSON-looking text must remain a string.
 
 `SIGTERM`/`SIGINT` stop accepting new connections and new `/v1/chat/completions` requests
 (`503`) immediately, then let in-flight requests finish naturally before the process exits —
-no hard-killed streams. Bounded by `SPARKINFER_SHUTDOWN_GRACE_S` (default `30`): a client that
-vanishes without a clean TCP close can otherwise leave the process waiting up to the read
-timeout, so after the grace period the process force-exits regardless.
+no hard-killed streams. The process exits as soon as the engine has nothing running and nothing
+waiting for capacity, so an idle instance exits within milliseconds rather than sitting out a
+grace period; what is drained is generation, not idle keep-alive sockets.
+
+`SPARKINFER_DRAIN_GRACE_S` (default `30`, previously `SPARKINFER_SHUTDOWN_GRACE_S`, still read)
+bounds the wait: after it, the process force-exits with requests still in flight. Set it to `0`
+to wait for in-flight work as long as it takes and let an orchestrator's own window do the
+killing — a 4096-token completion at ~93 tok/s needs ~45 s, more than the default grace.
 
 ### RTX PRO 6000 deploy (32k / 4k)
 
@@ -527,8 +532,9 @@ Prior requests cannot leak decode context into later ones (KV is freed after eac
 | `SPARKINFER_DSPARK_MAX_CTX` | `16384` | Context the DSpark drafter attends over (its own KV cache), capped at `--ctx`. |
 | `SPARKINFER_MAX_QUEUE_DEPTH` | `0` (unlimited) | Admission-time cap on the total active continuous-batch set (running and waiting between scheduler steps). Beyond it, new requests are rejected as `429` before KV allocation. Requests waiting for KV capacity count toward it. Production services that promise bounded admission should set this explicitly; `0` does not satisfy such a promise. |
 | `SPARKINFER_SAMPLING_DEFAULTS` | `generation_config` | What a request that omits `temperature`, `top_k` or `top_p` gets. `generation_config` uses the checkpoint's `generation_config.json` (Qwen3.8: temperature 1.0, top_k 20, top_p 0.95), as vLLM does; greedy decoding makes a thinking model loop on long agent tasks. `greedy` restores greedy decoding for those requests. A checkpoint without the file, and `SPARKINFER_DETERMINISTIC=1`, stay greedy. An explicit value, including `temperature: 0`, always wins. DSpark only speeds up greedy requests, so clients that want it should send `temperature: 0`. |
-| `SPARKINFER_ADMISSION_WAIT_S` | `300` | How long a request that finds no free KV capacity waits for it before `429`, oldest first. A request whose session memory cannot be allocated while other requests are running waits the same way, since their prefill scratch and session state come back as they progress; with nothing else running it gets `503` at once. `0` rejects immediately, the earlier behaviour. When `SPARKINFER_REQUEST_TIMEOUT_S` is set and shorter, the wait ends there and returns `504`. `/metrics` reports `sparkinfer_waiting_requests`, `sparkinfer_admission_waits_total` and `sparkinfer_admission_wait_timeouts_total`; `/v1/capacity` reports `waiting_requests`. |
+| `SPARKINFER_ADMISSION_WAIT_S` | `300` | How long a request that finds no free KV capacity waits for it before `429`, oldest first. Set `0` to refuse immediately instead of waiting, which is what a gateway that promises "reserve or `429`, never queue" wants (pair it with `SPARKINFER_MAX_QUEUE_DEPTH`). A request whose session memory cannot be allocated while other requests are running waits the same way, since their prefill scratch and session state come back as they progress; with nothing else running it gets `503` at once. `0` rejects immediately, the earlier behaviour. When `SPARKINFER_REQUEST_TIMEOUT_S` is set and shorter, the wait ends there and returns `504`. `/metrics` reports `sparkinfer_waiting_requests`, `sparkinfer_admission_waits_total` and `sparkinfer_admission_wait_timeouts_total`; `/v1/capacity` reports `waiting_requests`. |
 | `SPARKINFER_SPARSE_GQA6` | `0` | `1` makes Qwen3.8 decode attend only the first KV block and the last 4096 tokens once a sequence reaches 16384 tokens. Faster long-context decode, but the model can no longer read anything in between: a long agent session loses its earlier tool results and instructions. Leave it off unless every request is known to need only recent context. |
+| `SPARKINFER_DRAIN_GRACE_S` | `30` | How long `SIGTERM`/`SIGINT` waits for in-flight requests before force-exiting; `0` waits indefinitely. The process exits at once when nothing is in flight. `SPARKINFER_SHUTDOWN_GRACE_S` is the old name and is still read. |
 | `SPARKINFER_REQUEST_TIMEOUT_S` | `0` (disabled) | Per-request wall-clock deadline from submission to finish; exceeding it returns `504`. Left disabled by default — a cold 32k-context prefill alone has been measured taking ~90s of TTFT, so an aggressive default would misfire on legitimate long-context requests. |
 | `SPARKINFER_READ_TIMEOUT_S` / `SPARKINFER_WRITE_TIMEOUT_S` | `300` | Transport-level socket timeouts (httplib). Reset on each byte transferred, so a slow-but-progressing stream doesn't trip them. |
 | `SPARKINFER_MODEL_CREATED` | `0` | Model creation time as a Unix timestamp for OpenRouter schema v2.4. `run_openrouter.sh` requires a real value. |
@@ -547,6 +553,7 @@ above. Pass them with `-e NAME=value`. Server flags appended after the image nam
 |----------|---------|---------|
 | `CTX` | `262144`; `131072` with `serve-dspark` | Context length, passed as `--ctx` |
 | `SPARKINFER_MAX_OUTPUT_TOKENS` | `16384` | Per-request generation cap (see the table above) |
+| `SPARKINFER_NO_DOWNLOAD` | `0` | `1` never downloads: the weights must already be in `MODEL_DIR` (and `DRAFT_DIR` for `serve-dspark`). A missing checkpoint fails immediately with what to mount, instead of attempting an egress the box may not have. |
 | `MODEL_REPO` / `MODEL_DIR` | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` / `/models/qwen38-nvfp4` | Target checkpoint, downloaded on first run |
 | `DRAFT_REPO` / `DRAFT_DIR` | `gittensor-model-hub/Qwen3.8-27B-DSpark-NVFP4` / `/models/qwen38-dspark` | DSpark drafter, used by `serve-dspark` |
 | `MODEL_NAME` | `qwen38-nvfp4` | Model id the API advertises |

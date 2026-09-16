@@ -133,6 +133,10 @@ PlainAssistantOutput parse_plain_assistant_output(const std::string& raw, bool e
 // selects "messages" (chat completions) or "prompt" (text completions).
 std::string context_length_exceeded_error_json(size_t prompt_tokens, int max_tokens, int context_tokens, bool chat);
 
+// An OpenAI-shaped error body for `status`: {"error":{"message","type","code"}}. Clients branch on
+// `type`/`code` as well as the status line, and a bare {"message"} leaves them guessing.
+std::string api_error_json(int status, const std::string& message);
+
 // The opening of a native Qwen tool call that forces one: "<tool_call>\n<function=NAME>\n" for a
 // named function or for tool_choice=required with a single offered function, and
 // "<tool_call>\n<function=" for required with several (the model still writes the name, and can

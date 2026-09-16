@@ -15,6 +15,7 @@ using nlohmann::json;
 using sparkinfer_server::ChatRequest;
 using sparkinfer_server::ParsedToolOutput;
 using sparkinfer_server::PlainAssistantOutput;
+using sparkinfer_server::api_error_json;
 using sparkinfer_server::context_length_exceeded_error_json;
 using sparkinfer_server::ResponseFormat;
 using sparkinfer_server::ResponseFormatType;
@@ -1192,6 +1193,22 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_api_error_json_shape() {
+    // #1090: a queue-depth refusal must be a 429 an OpenAI-compatible client can classify, not a
+    // bare message.
+    const json overloaded = json::parse(api_error_json(429, "server overloaded: no capacity for this request right now"));
+    CHECK(overloaded["error"]["type"] == "rate_limit_error");
+    CHECK(overloaded["error"]["code"] == "server_overloaded");
+    CHECK(overloaded["error"]["message"].get<std::string>().find("no capacity") != std::string::npos);
+    CHECK(json::parse(api_error_json(503, "device out of memory"))["error"]["code"] == "server_unavailable");
+    CHECK(json::parse(api_error_json(504, "timed out"))["error"]["code"] == "request_timeout");
+    const json bad = json::parse(api_error_json(400, "unsupported \"role\""));
+    CHECK(bad["error"]["type"] == "invalid_request_error");
+    CHECK(!bad["error"].contains("code"));
+    CHECK(bad["error"]["message"] == "unsupported \"role\"");
+    return true;
+}
+
 bool test_context_length_exceeded_error() {
     // #1088: pi compacts and retries a turn only on an error it recognises as a context overflow, and
     // it (like most clients) recognises OpenAI's wording and code, not ours.
@@ -2007,6 +2024,7 @@ int main() {
     if (!test_request_controls_sampling_set_flags()) return 1;
     if (!test_truncated_tool_turn_keeps_reasoning()) return 1;
     if (!test_context_length_exceeded_error()) return 1;
+    if (!test_api_error_json_shape()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;

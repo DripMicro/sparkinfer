@@ -6,6 +6,12 @@ set -euo pipefail
 
 fetch() {  # repo dir label
   if [ ! -f "$2/config.json" ]; then
+    # SPARKINFER_NO_DOWNLOAD=1: the weights are pre-staged and the container has no route out
+    # (#1090). Say what is missing instead of failing inside a download that cannot work.
+    if [ "${SPARKINFER_NO_DOWNLOAD:-0}" = "1" ]; then
+      echo "[sparkinfer] SPARKINFER_NO_DOWNLOAD=1 and $2 holds no config.json: mount the $3 weights there, or point the matching *_DIR at them." >&2
+      exit 1
+    fi
     echo "[sparkinfer] downloading $3 ($1) — first run only, cached in /models"
     hf download "$1" --local-dir "$2"
   fi

@@ -712,6 +712,19 @@ sparkinfer_server::ChatRequest build_retry_request(const sparkinfer_server::Chat
     return retry;
 }
 
+// The HTTP status an SSE error event describes. A stream has already sent its headers, so the
+// status never reaches the wire -- but the error body it carries is the one a non-streaming call
+// would have returned, and its type/code are what a client branches on (#1090).
+template <class FailEnum>
+int stream_fail_status(FailEnum fail) {
+    switch (fail) {
+        case FailEnum::overloaded:   return 429;
+        case FailEnum::alloc_failed: return 503;
+        case FailEnum::timeout:      return 504;
+        default:                     return 500;
+    }
+}
+
 // SPARKINFER_LOG_TRUNCATED_OUTPUT=1: log the tail of a tool-calling or structured-output generation that
 // ran out of max_tokens or hit a stop sequence. Such a turn returns an empty message -- a partial call or
 // partial JSON is not an executable result -- so without this there is no way to see what the model was
@@ -1375,8 +1388,7 @@ int main(int argc, char** argv) {
         }
         auto fail = [&res](int status, const std::string& msg) {
             res.status = status;
-            res.set_content("{\"error\":{\"message\":\"" + json_escape(msg) + "\"}}",
-                            "application/json");
+            res.set_content(sparkinfer_server::api_error_json(status, msg), "application/json");
         };
 
         sparkinfer_server::ScoreRequest sreq;
@@ -2269,7 +2281,11 @@ int main(int argc, char** argv) {
                                      sink.done();
                                      return true;
                                  }
-                                 write_sse_json(gs, {{"error", {{"message", f.fail_message}}}});
+                                 // Same body a non-streaming failure returns: a stream that faults
+                                 // mid-flight is the same condition, and the client classifies it
+                                 // the same way (#1090).
+                                 write_sse_json(gs, nlohmann::json::parse(sparkinfer_server::api_error_json(
+                                     stream_fail_status(f.fail), f.fail_message)));
                                  // A client that explicitly asked for usage still deserves the
                                  // token counts even though generation faulted -- ttft/generation
                                  // timing isn't meaningful for a hard engine error, so omit those.
@@ -2683,7 +2699,7 @@ int main(int argc, char** argv) {
                          default:                                               g_requests_server_error++; break;
                      }
                      res.status = f.http_status;
-                     res.set_content("{\"error\":{\"message\":\"" + json_escape(f.http_error) + "\"}}",
+                     res.set_content(sparkinfer_server::api_error_json(f.http_status, f.http_error),
                                      "application/json");
                      return;
                  }
@@ -3009,7 +3025,11 @@ int main(int argc, char** argv) {
                                      sink.done();
                                      return true;
                                  }
-                                 write_sse_json(gs, {{"error", {{"message", f.fail_message}}}});
+                                 // Same body a non-streaming failure returns: a stream that faults
+                                 // mid-flight is the same condition, and the client classifies it
+                                 // the same way (#1090).
+                                 write_sse_json(gs, nlohmann::json::parse(sparkinfer_server::api_error_json(
+                                     stream_fail_status(f.fail), f.fail_message)));
                                  if (include_usage)
                                      write_stream_usage(gs, cid, created, (int)results[0].prompt_tokens,
                                                         (int)agg_completion, -1.0, -1.0, -1.0,
@@ -3189,7 +3209,7 @@ int main(int argc, char** argv) {
                          default:                                       g_requests_server_error++; break;
                      }
                      res.status = f.http_status;
-                     res.set_content("{\"error\":{\"message\":\"" + json_escape(f.http_error) + "\"}}",
+                     res.set_content(sparkinfer_server::api_error_json(f.http_status, f.http_error),
                                      "application/json");
                      return;
                  }
@@ -3783,7 +3803,7 @@ int main(int argc, char** argv) {
     // Set once listen() has returned, i.e. httplib has stopped accepting and its worker threads --
     // every in-flight request -- have finished.
     std::atomic<bool> listen_returned{false};
-    std::thread shutdown_watcher([&svr, &listen_returned] {
+    std::thread shutdown_watcher([&svr, &engine, &listen_returned] {
         while (!g_shutdown_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (listen_returned.load()) return;   // listen() ended by itself: nothing to drain
         fprintf(stderr, "[sparkinfer-server] shutdown signal received, draining in-flight requests...\n");
@@ -3795,23 +3815,44 @@ int main(int argc, char** argv) {
         // alone can make listen() take minutes to return, defeating the point of a "graceful"
         // shutdown. Bound the total drain time instead: same SIGTERM -> grace period -> force-kill
         // shape as Kubernetes' terminationGracePeriodSeconds.
-        const long grace_s = getenv("SPARKINFER_SHUTDOWN_GRACE_S")
-                                 ? atol(getenv("SPARKINFER_SHUTDOWN_GRACE_S")) : 30;
-        // Wait for the drain, not for the clock. Sleeping the whole grace period unconditionally
-        // made every shutdown take 30 s and end in "still draining -- forcing exit" even when
-        // listen() had returned at once -- main joins this thread, so it waited too -- and under
-        // Docker's default 10 s stop timeout the container was SIGKILLed instead.
+        // SPARKINFER_DRAIN_GRACE_S (SPARKINFER_SHUTDOWN_GRACE_S is the old name, still read):
+        // 0 means wait for in-flight work as long as it takes and let the orchestrator's own
+        // window do the killing (#1090).
+        const char* grace_env = getenv("SPARKINFER_DRAIN_GRACE_S");
+        if (!grace_env) grace_env = getenv("SPARKINFER_SHUTDOWN_GRACE_S");
+        const long grace_s = grace_env ? atol(grace_env) : 30;
+        // What has to drain is GENERATION, not sockets. Waiting for listen() to return waits for
+        // httplib's worker threads too, and an idle keep-alive connection (a health probe, a
+        // pooled client) holds one until the read timeout -- so an instance with nothing in
+        // flight sat out the whole grace period and was killed at the end of it (#1090: 30.0 s
+        // per lease cycle for nothing). Ask the engine instead: no request running and none
+        // waiting for capacity means this process owes nobody an answer.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(grace_s);
-        while (!listen_returned.load() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (listen_returned.load()) return;
-        fprintf(stderr, "[sparkinfer-server] shutdown grace period (%lds) elapsed with requests "
-                        "still draining -- forcing exit\n", grace_s);
-        _exit(0);  // not exit(): other threads may still be mid-flight; skip atexit/static dtors
+        for (;;) {
+            if (listen_returned.load()) return;   // httplib drained on its own: main exits below
+            const int in_flight = engine.active_requests() + engine.waiting_requests();
+            if (in_flight == 0) {
+                fprintf(stderr, "[sparkinfer-server] drained (nothing in flight), exiting\n");
+                fflush(stderr);
+                _exit(0);  // not exit(): other threads may still be mid-flight; skip atexit/static dtors
+            }
+            if (grace_s > 0 && std::chrono::steady_clock::now() >= deadline) {
+                fprintf(stderr, "[sparkinfer-server] drain grace (%lds) elapsed with %d request(s) "
+                                "still in flight -- forcing exit\n", grace_s, in_flight);
+                fflush(stderr);
+                _exit(0);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
     });
 
     const std::string queue_depth_label =
         engine.max_queue_depth() > 0 ? std::to_string(engine.max_queue_depth()) : std::string("unlimited");
+    const char* drain_grace_env = getenv("SPARKINFER_DRAIN_GRACE_S");
+    if (!drain_grace_env) drain_grace_env = getenv("SPARKINFER_SHUTDOWN_GRACE_S");
+    const long drain_grace_s = drain_grace_env ? atol(drain_grace_env) : 30;
+    const std::string drain_grace_label =
+        drain_grace_s > 0 ? std::to_string(drain_grace_s) + "s" : std::string("unbounded");
     fprintf(stderr,
             "[sparkinfer-server] OpenAI-compatible API on http://%s:%d\n"
             "  GET  /health\n"
@@ -3825,9 +3866,10 @@ int main(int argc, char** argv) {
             "  POST /v1/score\n"
             "  POST /v1/messages  POST /v1/messages/count_tokens  (Anthropic)\n"
             "  POST /v1/responses  (OpenAI Responses, stateless)\n"
-            "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s%s\n",
+            "  read_timeout=%lds write_timeout=%lds max_output_tokens=%d max_queue_depth=%s"
+            " drain_grace=%s%s\n",
             host.c_str(), port, read_timeout_s, write_timeout_s, max_output_tokens(),
-            queue_depth_label.c_str(),
+            queue_depth_label.c_str(), drain_grace_label.c_str(),
             sparkinfer::deterministic_mode() ? "  DETERMINISTIC=1 (bit-reproducible)" : "");
 
     svr.listen_after_bind();   // bind already succeeded above; this only returns on stop()

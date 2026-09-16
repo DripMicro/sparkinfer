@@ -2446,6 +2446,20 @@ std::string context_length_exceeded_error_json(size_t prompt_tokens, int max_tok
                            {"code", "context_length_exceeded"}}}}.dump();
 }
 
+std::string api_error_json(int status, const std::string& message) {
+    const char* type = status >= 500 ? "server_error"
+                     : status == 429 ? "rate_limit_error"
+                                     : "invalid_request_error";
+    json err{{"message", message}, {"type", type}};
+    // A refusal a caller can act on: back off and retry elsewhere (429), wait for the operator
+    // (503), or shorten the work (504). #1090's gateway promises "reserve or 429, never queue".
+    if (status == 429)      err["code"] = "server_overloaded";
+    else if (status == 503) err["code"] = "server_unavailable";
+    else if (status == 504) err["code"] = "request_timeout";
+    else if (status == 401) err["code"] = "invalid_api_key";
+    return json{{"error", err}}.dump();
+}
+
 bool build_response_format_grammar(const ChatRequest& request, bool enable_thinking, ToolCallGrammar& out,
                                    std::string& err) {
     out = ToolCallGrammar{};
