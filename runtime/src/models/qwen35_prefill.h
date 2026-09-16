@@ -106,6 +106,21 @@ struct Qwen35PrefillCtx {
     void* const*         packed_lin_conv  = nullptr;
     // The packed rows' recurrent state is the compacted bf16 form (see Qwen35Model::decode_packed).
     bool                 packed_state_b16 = false;
+
+    // PACKED PROMPT PREFILL. multi_n > 0 turns the pass's N rows from ONE prompt into multi_n
+    // FRESH prompts laid end to end: prompt i is rows [multi_off[i], multi_off[i] + multi_len[i])
+    // at positions 0.. of its own session multi_seq_ids[i]. Everything row-wise -- the norms, the
+    // projections, the FFN -- runs once over all N rows; only what belongs to a sequence (the
+    // recurrent-state reset, the Gated-DeltaNet conv and scan, the KV write and attention, and
+    // the seed) runs per prompt on its own slice. HOST arrays of multi_n entries; multi_seed
+    // receives each prompt's argmax seed. See Qwen35Model::ingest_prompts_packed.
+    int                  multi_n          = 0;
+    const int*           multi_off        = nullptr;
+    const int*           multi_len        = nullptr;
+    const uint64_t*      multi_seq_ids    = nullptr;
+    float* const*        multi_lin_state  = nullptr;
+    void* const*         multi_lin_conv   = nullptr;
+    int*                 multi_seed       = nullptr;
 };
 
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.

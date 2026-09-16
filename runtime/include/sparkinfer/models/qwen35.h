@@ -462,6 +462,14 @@ public:
     void release_lm_head_fp4();
     int prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob = false,
                         int pos0 = 0);
+    // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
+    // each session opened with nothing ingested yet, text only, no logit_bias. On success writes
+    // each prompt's argmax seed -- the token ingest_prompt_range() would have returned for it -- to
+    // seeds[i] and returns true. Returns false when the pack is not eligible or a stage declines;
+    // the caller then ingests the prompts one at a time from position 0, which resets whatever
+    // this pass had written.
+    bool ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts, const int* lens,
+                               int n_prompts, int* seeds);
     // Same pass, ingested as position-windows so the scratch arena is bounded by the window
     // rather than by n. Returns the seed for the last token, or -1 if a window was refused --
     // in which case *out_done (when given) reports how many leading tokens ARE in the cache,

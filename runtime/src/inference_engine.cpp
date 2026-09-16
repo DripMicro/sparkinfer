@@ -664,6 +664,7 @@ void ContinuousBatchEngine::worker_loop() {
         // filling (see Scheduler::schedule). They run back to back on this thread, which is the
         // point: each one widens the next decode step, and a decode step's cost is almost all
         // fixed weight read.
+        step_prefills_packed(prefill_ids);
         for (uint64_t pid : prefill_ids) {
             Job* job = nullptr;
             {
@@ -849,6 +850,83 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         for (size_t i = 0; i < m; i++) live[off + i]->next_token = out[i];
     }
     return true;
+}
+
+// PACKED PROMPT PREFILL. A burst of requests is a burst of prompts, and prefilling them one pass
+// each leaves most of the batched pass's width unused: the same pass runs 5858 tok/s at 256 rows
+// and 10972 at 4096 (RTX 5090, unsloth Qwen3.8), yet 32 arriving 256-token prompts went through
+// it as 32 separate passes before the first decode token -- about a fifth of a c32 run. So the
+// fresh, text-only prompts the scheduler hands over are prefilled together in passes of up to
+// SPARKINFER_PREFILL_PACK_TOKENS rows (0 disables). Anything a pack cannot carry -- logprobs,
+// logit_bias, a constraint, forced tokens, an image, prefix-cache work, or an exactly-512-token
+// prompt (which the batched pass keeps on bf16 GDN) -- takes step_job unchanged, and so does
+// every job in a pack the model declines.
+void ContinuousBatchEngine::step_prefills_packed(std::vector<uint64_t>& prefill_ids) {
+    static const int pack_tokens = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_PACK_TOKENS");
+        const int v = e ? atoi(e) : 4096;
+        return v < 0 ? 0 : v;
+    }();
+    if (pack_tokens <= 0 || prefill_ids.size() < 2 || device_lost()) return;
+    std::vector<Job*> eligible;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (uint64_t pid : prefill_ids) {
+            auto it = jobs_.find(pid);
+            if (it == jobs_.end() || it->second->done) continue;
+            Job& j = *it->second;
+            const int n = (int)j.req.prompt.size();
+            const bool plain =
+                j.phase == SeqPhase::PREFILL && j.prefill_pos == 0 && j.req.prefill_start == 0 &&
+                j.cached_tokens == 0 && j.seq_id != 0 && !j.req.use_prefix_session &&
+                j.req.vision_pos.empty() && j.req.mrope_pos.empty() && j.req.forced_tokens.empty() &&
+                !j.req.logprobs && j.req.logit_bias.empty() && !j.req.constraint &&
+                !(prefix_cache_ && j.req.prefix_cache && !j.req.cache_checkpoints.empty());
+            if (plain && n >= 2 && n <= pack_tokens && n != 512) eligible.push_back(&j);
+        }
+    }
+    if (eligible.size() < 2) return;
+    std::vector<std::vector<Job*>> packs;
+    int rows = 0;
+    for (Job* j : eligible) {
+        const int n = (int)j->req.prompt.size();
+        if (packs.empty() || rows + n > pack_tokens) {
+            packs.emplace_back();
+            rows = 0;
+        }
+        packs.back().push_back(j);
+        rows += n;
+    }
+    std::vector<uint64_t> packed;
+    for (auto& pk : packs) {
+        if (pk.size() < 2) continue;
+        std::vector<uint64_t> sids;
+        std::vector<const int*> prompts;
+        std::vector<int> lens, seeds(pk.size(), -1);
+        for (Job* j : pk) {
+            sids.push_back(j->seq_id);
+            prompts.push_back(j->req.prompt.data());
+            lens.push_back((int)j->req.prompt.size());
+        }
+        // Text-only prompts: clear the rotary decode offset, exactly as step_job does before each.
+        model_->reset_mrope_offset();
+        if (!model_->ingest_prompts_packed(sids.data(), prompts.data(), lens.data(),
+                                           (int)pk.size(), seeds.data()))
+            continue;
+        for (size_t k = 0; k < pk.size(); ++k) {
+            pk[k]->prefill_pos = lens[k];
+            pk[k]->next_token = seeds[k];
+            pk[k]->phase = SeqPhase::DECODE;
+            packed.push_back(pk[k]->request_id);
+        }
+    }
+    if (packed.empty()) return;
+    prefill_ids.erase(std::remove_if(prefill_ids.begin(), prefill_ids.end(),
+                                     [&](uint64_t id) {
+                                         return std::find(packed.begin(), packed.end(), id) !=
+                                                packed.end();
+                                     }),
+                      prefill_ids.end());
 }
 
 bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {

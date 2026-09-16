@@ -3214,6 +3214,61 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     return seed;
 }
 
+bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts,
+                                        const int* lens, int n_prompts, int* seeds) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (!seq_ids || !prompts || !lens || !seeds || n_prompts < 2) return false;
+    if (!s.gguf || !s.cfg.hybrid || !s.cfg.dense_ffn || s.cfg.muse_glimmer) return false;
+    // Per-request staging belongs to exactly one prompt, so a pack cannot carry it.
+    if (s.dflash_capture || s.d_vision_emb || s.d_mrope_pos) return false;
+    std::vector<int> off((size_t)n_prompts);
+    std::vector<float*> lin_state((size_t)n_prompts);
+    std::vector<void*> lin_conv((size_t)n_prompts);
+    int total = 0;
+    for (int i = 0; i < n_prompts; ++i) {
+        auto it = s.sessions.find(seq_ids[i]);
+        if (it == s.sessions.end() || !prompts[i] || lens[i] <= 0) return false;
+        // The pass's seed is a raw argmax; a session with a logit bias needs prefill_batched's re-pick.
+        if (!it->second.lin_state || !it->second.lin_conv_state || it->second.logit_bias_set)
+            return false;
+        off[(size_t)i] = total;
+        total += lens[i];
+        lin_state[(size_t)i] = it->second.lin_state;
+        lin_conv[(size_t)i] = it->second.lin_conv_state;
+    }
+    if (!batched_prefill_windowed_enabled(s.gguf, s.cfg, total) ||
+        total > prefill_single_pass_max_tokens())
+        return false;
+    std::vector<int> ids;
+    ids.reserve((size_t)total);
+    for (int i = 0; i < n_prompts; ++i) ids.insert(ids.end(), prompts[i], prompts[i] + lens[i]);
+    for (int i = 0; i < n_prompts; ++i) {
+        // Position-0 batched prefill writes the whole recurrent state as fp32 (see prefill_batched).
+        s.sessions[seq_ids[i]].lin_state_b16 = false;
+        if (s.active_seq_id == seq_ids[i]) s.active_lin_state_b16 = false;
+        seeds[i] = -1;
+    }
+    Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
+                          lin_state[0], lin_conv[0],
+                          s.logits, s.d_out_id, s.h_out_id, s.gguf,
+                          s.emb_norm_ones,
+                          s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
+                          s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
+                          nullptr, 0, nullptr, 0 };
+    ctx.multi_n = n_prompts;
+    ctx.multi_off = off.data();
+    ctx.multi_len = lens;
+    ctx.multi_seq_ids = seq_ids;
+    ctx.multi_lin_state = lin_state.data();
+    ctx.multi_lin_conv = lin_conv.data();
+    ctx.multi_seed = seeds;
+    if (prefill_batched_run(ctx, ids.data(), total, 0) < 0) return false;
+    for (int i = 0; i < n_prompts; ++i)
+        if (seeds[i] < 0 || seeds[i] >= s.cfg.vocab) return false;
+    return true;
+}
+
 int Qwen35Model::prefill_batched_chunked(const int* prompt_ids, int n, bool want_seed_logprob,
                                          int* out_done) {
     if (out_done) *out_done = 0;
