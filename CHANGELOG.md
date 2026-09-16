@@ -3,6 +3,67 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.5.8] — 2026-09-16
+
+**Long agent sessions work.** Past 16,384 tokens, decode attended only the attention sink and the
+most recent 4,096 tokens: everything in between was invisible to the tokens being generated, so an
+agent lost sight of its own session within a few turns. That was a default-on decode optimisation
+(#958) whose accuracy gate never used a prompt long enough to reach it. Exact attention is the
+default again; `SPARKINFER_SPARSE_GQA6=1` opts back in. This release also ends a lease cleanly for
+an orchestrator, refuses with a body a client can classify, and fixes eight further faults a real
+`prime-agent` session hit on `serve-dspark`.
+
+### Long context and agent sessions (#1088)
+
+Found by running real pi agents against `serve-dspark` at `--ctx 131072`, then reproducing each
+fault on its own:
+
+- **Exact attention above 16K.** A 44,000-token prompt with one `ERROR` line 20,000 tokens back
+  answered "There is no line containing ERROR"; it now quotes the line and the one before it.
+  Long-context decode is slower for it (95 → 85.7 tok/s at ctx 32768).
+- **Prompts longer than the draft context** no longer fail with `speculative decode failed`: the
+  drafter's eligibility now bounds the whole prompt, not the captured window.
+- **Reasoning streams live in tool-calling turns.** A turn that offers tools buffered everything
+  until the tool XML was complete, so an agent saw nothing for minutes and got an empty message if
+  the turn hit its token limit. Reasoning now streams, and a truncated turn keeps it.
+- **A request without `max_tokens`** generates to the output cap or the room its prompt leaves,
+  not 256 tokens.
+- **A request that omits temperature** takes the checkpoint's `generation_config.json` sampling
+  rather than greedy decoding; `SPARKINFER_SAMPLING_DEFAULTS=greedy` restores the old behaviour.
+- **Capacity waits instead of refusing.** A request that finds no free KV, or whose session memory
+  is held by requests already running, waits in admission (`SPARKINFER_ADMISSION_WAIT_S`, default
+  300) instead of returning 429/503 at once. `0` refuses immediately.
+- **A cached prefix followed by a long continuation** is windowed rather than dropped onto the
+  token loop: time to first token for a 44K-token prompt fell from 348 s to 4.7 s.
+- **DSpark capture buffers are freed** with the capture, and a handled allocation failure elsewhere
+  no longer fails a request that finished.
+- **Context overflow** returns OpenAI's wording and `code: context_length_exceeded`, which is what
+  agent clients match to compact their history and retry.
+
+### Deployment (#1090)
+
+- **Drain.** `SIGTERM` exits as soon as nothing is running and nothing waits for capacity — 0.34 s
+  for an idle instance, where it used to sit out the full grace period.
+- **`SPARKINFER_DRAIN_GRACE_S`** (default 30, `SPARKINFER_SHUTDOWN_GRACE_S` still read); `0` waits
+  for in-flight work as long as it takes.
+- **Failure bodies carry OpenAI's `type` and `code`**, streamed and not: `rate_limit_error` /
+  `server_overloaded` for 429, `server_unavailable` for 503, `request_timeout` for 504.
+- **`SPARKINFER_NO_DOWNLOAD=1`** serves pre-staged weights and never reaches for the network.
+
+### Performance
+
+- Prompts that arrive together are prefilled in one packed pass (#1089).
+- Q4_K attention k/v and gate/up on the int8 tensor cores; cheaper staging and a single-pass FP8
+  row quantize (#1085, #1091).
+- Muse Glimmer: packed decode projects q, gate, k and v in one launch (#1092); Gated-DeltaNet
+  recurrent state held only for the layers that have it.
+
+### Serving and docs
+
+- `serve-dspark` defaults to `--ctx 131072`, and a drafter that cannot fit fails startup with what
+  to lower (#1086).
+- Serving Qwen3.8 from a Q4_K_M GGUF, and what differs from NVFP4 (#1087).
+
 ## [0.5.7] — 2026-09-14
 
 **Tool calls and structured output are grammar-constrained.** Every token of a tool-calling or
