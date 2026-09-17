@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <re2/re2.h>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <sstream>
@@ -1387,6 +1388,25 @@ bool parse_chat_request_json(const std::string& body, ChatRequest& request, std:
             parsed.reasoning_exclude = reasoning["exclude"].get<bool>();
         }
     }
+    // preserve_thinking: the pinned template's own kwarg (#1094). SPARKINFER_PRESERVE_THINKING=0
+    // flips the server-wide default; a request that names it wins either way.
+    static const bool preserve_thinking_default = [] {
+        const char* e = getenv("SPARKINFER_PRESERVE_THINKING");
+        return !(e && e[0] == '0');
+    }();
+    parsed.preserve_thinking = preserve_thinking_default;
+    auto read_preserve = [&](const json& holder, const char* where) -> bool {
+        if (!holder.contains("preserve_thinking") || holder["preserve_thinking"].is_null()) return true;
+        if (!holder["preserve_thinking"].is_boolean())
+            return set_error(err, std::string(where) + " must be a boolean");
+        parsed.preserve_thinking = holder["preserve_thinking"].get<bool>();
+        parsed.preserve_thinking_set = true;
+        return true;
+    };
+    if (!read_preserve(root, "preserve_thinking")) return false;
+    if (root.contains("chat_template_kwargs") && root["chat_template_kwargs"].is_object() &&
+        !read_preserve(root["chat_template_kwargs"], "chat_template_kwargs.preserve_thinking"))
+        return false;
     for (size_t i = 0; i < parsed.messages.size(); ++i) {
         for (const ToolCall& call : parsed.messages[i].tool_calls) {
             if (!offered.count(call.name))
@@ -1944,9 +1964,12 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
                                                        std::char_traits<char>::length(kThinkClose)));
                 }
             }
-            // The pinned template preserves reasoning only for assistant/tool steps after the
-            // latest real user query. Older chain-of-thought is intentionally not replayed.
-            if (i > last_user)
+            // The pinned template's rule, verbatim: `reasoning and (preserve_thinking or
+            // index0 > last_user_index)`, with preserve_thinking defaulting to TRUE. Only the
+            // second half of that was implemented here, so every thought from before the latest
+            // user turn was dropped -- the coherence loss long agent sessions report (#1094). An
+            // empty block is never emitted: the template requires non-empty reasoning too.
+            if (!reasoning.empty() && (request.preserve_thinking || i > last_user))
                 out << kThinkOpen << '\n' << reasoning << '\n' << kThinkClose << "\n\n";
             if (!message.content_is_null) out << content;
             for (size_t j = 0; j < message.tool_calls.size(); ++j) {

@@ -1193,6 +1193,70 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_preserve_thinking_replays_full_history() {
+    // #1094: the pinned template's rule is `reasoning and (preserve_thinking or index0 >
+    // last_user_index)`, and preserve_thinking defaults to TRUE -- so an ordinary multi-turn chat
+    // replays every assistant turn's reasoning. Only the second half of that rule was implemented,
+    // which dropped every thought from before the latest user turn.
+    json history = json::array();
+    history.push_back({{"role", "user"}, {"content", "first question"}});
+    history.push_back({{"role", "assistant"}, {"content", "first answer"},
+                       {"reasoning_content", "EARLY_THOUGHT"}});
+    history.push_back({{"role", "user"}, {"content", "second question"}});
+    history.push_back({{"role", "assistant"}, {"content", "second answer"},
+                       {"reasoning_content", "LATE_THOUGHT"}});
+    history.push_back({{"role", "user"}, {"content", "third question"}});
+
+    json body;
+    body["messages"] = history;
+    ChatRequest kept;
+    CHECK(parse_request(body.dump(), kept));
+    CHECK(kept.preserve_thinking);
+    CHECK(!kept.preserve_thinking_set);
+    const std::string full = apply_qwen36_tools_template(kept, true);
+    CHECK(contains(full, "EARLY_THOUGHT"));
+    CHECK(contains(full, "LATE_THOUGHT"));
+
+    json off_body = body;
+    off_body["chat_template_kwargs"] = json{{"preserve_thinking", false}};
+    ChatRequest off;
+    CHECK(parse_request(off_body.dump(), off));
+    CHECK(!off.preserve_thinking);
+    CHECK(off.preserve_thinking_set);
+    const std::string trimmed = apply_qwen36_tools_template(off, true);
+    CHECK(!contains(trimmed, "EARLY_THOUGHT"));
+    CHECK(!contains(trimmed, "LATE_THOUGHT"));
+
+    // The chain the model is still working on -- an assistant turn after the last user message --
+    // keeps its reasoning either way.
+    json chain_body;
+    json chain = json::array();
+    chain.push_back({{"role", "user"}, {"content", "q"}});
+    chain.push_back({{"role", "assistant"}, {"content", "working on it"},
+                     {"reasoning_content", "CHAIN_THOUGHT"}});
+    chain_body["messages"] = chain;
+    chain_body["chat_template_kwargs"] = json{{"preserve_thinking", false}};
+    ChatRequest chain_request;
+    CHECK(parse_request(chain_body.dump(), chain_request));
+    CHECK(contains(apply_qwen36_tools_template(chain_request, true), "CHAIN_THOUGHT"));
+
+    // No reasoning, no block: the template emits <think> only for non-empty reasoning.
+    json bare_body;
+    json bare = json::array();
+    bare.push_back({{"role", "user"}, {"content", "q"}});
+    bare.push_back({{"role", "assistant"}, {"content", "a"}});
+    bare_body["messages"] = bare;
+    ChatRequest bare_request;
+    CHECK(parse_request(bare_body.dump(), bare_request));
+    CHECK(!contains(apply_qwen36_tools_template(bare_request, true), "<think>\n\n</think>"));
+
+    json bad = body;
+    bad["chat_template_kwargs"] = json{{"preserve_thinking", "yes"}};
+    ChatRequest rejected;
+    CHECK(!parse_request(bad.dump(), rejected));
+    return true;
+}
+
 bool test_api_error_json_shape() {
     // #1090: a queue-depth refusal must be a 429 an OpenAI-compatible client can classify, not a
     // bare message.
@@ -2025,6 +2089,7 @@ int main() {
     if (!test_truncated_tool_turn_keeps_reasoning()) return 1;
     if (!test_context_length_exceeded_error()) return 1;
     if (!test_api_error_json_shape()) return 1;
+    if (!test_preserve_thinking_replays_full_history()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;

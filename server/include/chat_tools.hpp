@@ -75,6 +75,12 @@ struct ChatRequest {
     // Qwen3.8 system instruction; empty means the model's default (xhigh).
     std::string reasoning_effort;
     bool reasoning_exclude = false;
+    // chat_template_kwargs.preserve_thinking (top-level `preserve_thinking` is accepted too).
+    // True replays EVERY assistant turn's reasoning, which is what the pinned chat template does by
+    // default; false replays only the turns since the last user message. llama.cpp calls this
+    // --reasoning-preserve and also defaults it on (#1094).
+    bool preserve_thinking = true;
+    bool preserve_thinking_set = false;   // the request said so explicitly; the env default loses
     ResponseFormat response_format;
     // Server-internal, never read from a request body: raw template text the assistant turn starts
     // with, after the generation prompt, so the model continues from it. The server uses it to force
