@@ -333,6 +333,37 @@ The bot evaluates PRs **oldest-first** and fingerprints each diff, so gaming is 
 - **No override.** There is no way to force-evaluate around the gate — not even for a maintainer.
   Real, original, frontier-advancing work is the only thing that scores.
 
+### Noise (a 3-day parked tier)
+
+Separate from gaming, and much smaller: an account that floods the project with **off-topic, spammy
+or disruptive traffic** can be listed in [`.github/noise-ban-list.txt`](.github/noise-ban-list.txt)
+for **3 days**. While listed, every `eval*:<tier>` label on that account's PRs is swapped for
+`eval*:<tier>-p` ("parked"). SN74 scores `eval:*`, so a parked tier earns nothing for the window.
+
+What a noise ban does **not** do:
+
+- **Nothing is closed, re-scored, or thrown away.** No PR is closed, no comment is posted, no
+  measurement is repeated. The tier stays spelled out inside the parked label, and when the window
+  ends the bot puts back exactly what the eval measured — a ban costs 3 days of emissions, never a
+  verdict you earned.
+- **`eval:none` is never parked**, in any family: it is worth nothing already and it is how the
+  bots record "evaluated, no speedup".
+- **It is not for disagreeing with us.** Contesting a verdict, asking for a re-run, reporting a
+  harness error, or pointing out a mistake that benefited you is *wanted* — that is how the
+  measured record stays honest, and none of it is noise.
+
+The list is maintainer-owned (see [CODEOWNERS](.github/CODEOWNERS)), one account per line with the
+UTC date the ban starts; re-offending updates that date rather than adding a line. Expired entries
+stay as the record of what was done and to whom.
+
+**If you think a listing is wrong**, say so on any of your PRs or open an issue. A maintainer
+removes the line, and the next hourly sweep restores every parked label automatically — no GPU run
+and no re-evaluation is needed, so a correction costs nothing but the hour.
+
+This is the temporary, reversible end of the scale. The permanent end is
+[`.github/blocked-contributors.txt`](.github/blocked-contributors.txt) (sybil / emission farming),
+where the PR is labeled `flagged:gaming`, commented, closed, and never evaluated.
+
 ## Maintainer-owned paths (eval, scoring & governance)
 
 The evaluation harness and scoring config are **maintainer-owned** and must not be changed

@@ -279,6 +279,7 @@ Open a PR — a bot evaluates every ~30 min: source build on RTX 5090, correctne
 | `none` | correct, no verified improvement |
 | `REJECT` | failed correctness or regression |
 | `BASELINE` | first verified frontier entry |
+| `<tier>-p` | tier parked by a temporary [noise ban](CONTRIBUTING.md#noise-a-3-day-parked-tier) — earns nothing until the 3 days lift, then restored exactly as measured |
 
 ## Contributing
 
