@@ -3,6 +3,20 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.5.10] — 2026-09-17
+
+**An assistant message can be sent back exactly as it arrived.** A response carries `reasoning`
+beside `reasoning_content`, streamed and not, but the request validator accepted only
+`reasoning_content`: a client that appends the message it just received — `message.model_dump()`,
+the standard OpenAI SDK pattern — got `400 … contains unsupported field reasoning` on its next
+turn, which breaks any multi-turn agent. The SDKs carry `refusal`, `annotations`, `audio` and
+`function_call` as nulls in that same object, so those are accepted now too.
+
+`reasoning` is used rather than ignored: it holds the same text, and since 0.5.9 a previous turn's
+reasoning is replayed into the prompt, so a client that kept only that field still gets its
+thinking back. `reasoning_content` stays canonical when both are present. A field the server never
+emits is still reported by name — the strictness is what made this easy to find.
+
 ## [0.5.9] — 2026-09-17
 
 **The release container runs as a Gittensor compute-pool workload**, verifying pre-staged weights
