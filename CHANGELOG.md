@@ -3,6 +3,46 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.5.9] — 2026-09-17
+
+**The release container runs as a Gittensor compute-pool workload**, verifying pre-staged weights
+against a signed manifest instead of downloading anything, and a conversation's reasoning now
+survives the whole history the way the checkpoint's own chat template intends.
+
+### Serving
+
+- **Compute-pool manifest and artifact-verifying entrypoint** (#1098). The image ships
+  `docker/gittensor-manifest.yaml` (placement, env, artifacts by HF revision + sha256, health
+  probe, tool-call entry canaries, drain) and an entrypoint that, with
+  `SPARKINFER_NO_DOWNLOAD=1`, hashes every artifact on disk before serving and refuses to start on
+  a mismatch. `SPARKINFER_MODE=serve-dspark` selects the drafter from the environment for
+  orchestrators that set env but not arguments. Without those variables the entrypoint is a
+  pass-through: `docker run … serve-dspark` and `bench` behave exactly as before.
+
+### Chat
+
+- **A previous turn's reasoning is replayed for the whole history** (#1094), as the pinned
+  template does: its rule is `reasoning and (preserve_thinking or index0 > last_user_index)` with
+  `preserve_thinking` defaulting to true, and only the second half of that was implemented — every
+  thought from before the latest user turn was dropped, which is the coherence loss long agent
+  sessions reported. `chat_template_kwargs.preserve_thinking` sets it per request and
+  `SPARKINFER_PRESERVE_THINKING=0` server-wide (llama.cpp calls this `--reasoning-preserve`). An
+  assistant turn with no reasoning no longer gets an empty `<think></think>` block.
+
+### Performance — Muse Glimmer
+
+- Narrow packed decode: FFN kernels sized to the batch (1.08x concurrent decode @c2, #1097), and
+  attention plus the LM-head Q4_K rows kernels run at the batch width (1.03x @c2, #1100).
+- Prefill: the o-proj streams to NVFP4 with operands built straight from Q4_K (1.02x @16k–64k,
+  #1101), and the Q4_K → NVFP4 operand kernel decodes only each lane's own eight values while
+  sharing the group amax (1.05x prefill @4k, #1102).
+
+### Project
+
+- A listed account's eval tiers are parked as `<tier>-p` for three days and then restored exactly
+  as measured (#1099); CONTRIBUTING says what that does, what it never touches — nothing is closed,
+  re-scored, or thrown away, and contesting a verdict is not noise — and how to contest a listing.
+
 ## [0.5.8] — 2026-09-16
 
 **Long agent sessions work.** Past 16,384 tokens, decode attended only the attention sink and the
