@@ -1193,6 +1193,57 @@ bool test_validate_response_format_json_schema() {
     return true;
 }
 
+bool test_assistant_message_round_trips() {
+    // A client that appends the assistant message it received -- role, content, reasoning,
+    // reasoning_content, tool_calls, plus the nulls the OpenAI SDKs carry -- must be accepted:
+    // the server emits every one of those fields itself.
+    json assistant;
+    assistant["role"] = "assistant";
+    assistant["content"] = "42";
+    assistant["reasoning"] = "ROUND_TRIPPED_THOUGHT";
+    assistant["reasoning_content"] = "ROUND_TRIPPED_THOUGHT";
+    assistant["refusal"] = nullptr;
+    assistant["annotations"] = json::array();
+    assistant["audio"] = nullptr;
+    assistant["function_call"] = nullptr;
+    json body;
+    body["messages"] = json::array({json{{"role", "user"}, {"content", "what is 6 times 7?"}},
+                                    assistant,
+                                    json{{"role", "user"}, {"content", "and double it?"}}});
+    ChatRequest request;
+    CHECK(parse_request(body.dump(), request));
+    CHECK(request.messages[1].reasoning_content == "ROUND_TRIPPED_THOUGHT");
+    CHECK(contains(apply_qwen36_tools_template(request, true), "ROUND_TRIPPED_THOUGHT"));
+
+    // `reasoning` alone is used, not dropped: some clients keep only that field.
+    json only_reasoning;
+    only_reasoning["role"] = "assistant";
+    only_reasoning["content"] = "42";
+    only_reasoning["reasoning"] = "ONLY_REASONING_FIELD";
+    json alt = body;
+    alt["messages"][1] = only_reasoning;
+    ChatRequest alt_request;
+    CHECK(parse_request(alt.dump(), alt_request));
+    CHECK(alt_request.messages[1].reasoning_content == "ONLY_REASONING_FIELD");
+
+    // reasoning_content stays canonical when the two disagree.
+    json both = body;
+    both["messages"][1]["reasoning"] = "ALIAS";
+    both["messages"][1]["reasoning_content"] = "CANONICAL";
+    ChatRequest both_request;
+    CHECK(parse_request(both.dump(), both_request));
+    CHECK(both_request.messages[1].reasoning_content == "CANONICAL");
+
+    // Still strict about fields the server never emits: a typo is reported, not silently ignored.
+    json typo = body;
+    typo["messages"][1]["reasonning"] = "oops";
+    ChatRequest rejected;
+    std::string err;
+    CHECK(!parse_chat_request_json(typo.dump(), rejected, err));
+    CHECK(err.find("reasonning") != std::string::npos);
+    return true;
+}
+
 bool test_preserve_thinking_replays_full_history() {
     // #1094: the pinned template's rule is `reasoning and (preserve_thinking or index0 >
     // last_user_index)`, and preserve_thinking defaults to TRUE -- so an ordinary multi-turn chat
@@ -2090,6 +2141,7 @@ int main() {
     if (!test_context_length_exceeded_error()) return 1;
     if (!test_api_error_json_shape()) return 1;
     if (!test_preserve_thinking_replays_full_history()) return 1;
+    if (!test_assistant_message_round_trips()) return 1;
     if (!test_request_controls_seed_validation()) return 1;
     if (!test_request_controls_top_p_validation()) return 1;
     if (!test_request_controls_top_k_validation()) return 1;

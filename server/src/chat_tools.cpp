@@ -680,8 +680,14 @@ void strip_trailing_im_end(std::string& value) {
 bool parse_message(const json& value, ChatMessage& message, size_t index, std::string& err) {
     const std::string where = "messages[" + std::to_string(index) + "]";
     if (!value.is_object()) return set_error(err, where + " must be an object");
+    // Whatever the server puts on an assistant message it must take back: a client that appends
+    // the message it received -- the standard OpenAI SDK pattern -- resends every field verbatim.
+    // `reasoning` is our own alias for `reasoning_content` (both are emitted, streamed and not),
+    // and `refusal` / `annotations` / `audio` / `function_call` are the response fields the OpenAI
+    // SDKs carry as nulls in a round-tripped message; none of them changes what we serve.
     if (!is_allowed_key(value,
-                        {"role", "content", "reasoning_content", "name", "tool_call_id", "tool_calls"},
+                        {"role", "content", "reasoning", "reasoning_content", "name", "tool_call_id",
+                         "tool_calls", "refusal", "annotations", "audio", "function_call"},
                         where, err)) return false;
     if (!value.contains("role") || !value["role"].is_string())
         return set_error(err, where + ".role must be a string");
@@ -703,6 +709,16 @@ bool parse_message(const json& value, ChatMessage& message, size_t index, std::s
         if (!value["reasoning_content"].is_string())
             return set_error(err, where + ".reasoning_content must be a string");
         message.reasoning_content = value["reasoning_content"].get<std::string>();
+    }
+    // `reasoning` is not merely tolerated: it carries the same text, and since #1094 a previous
+    // turn's reasoning is replayed into the prompt, so a client that kept only this field still
+    // gets its thinking back. reasoning_content wins when both are present -- it is the canonical
+    // one, and a client that edited one and not the other means the one it edited.
+    if (value.contains("reasoning") && !value["reasoning"].is_null() &&
+        message.reasoning_content.empty()) {
+        if (!value["reasoning"].is_string())
+            return set_error(err, where + ".reasoning must be a string");
+        message.reasoning_content = value["reasoning"].get<std::string>();
     }
     if (value.contains("name")) {
         if (!value["name"].is_string()) return set_error(err, where + ".name must be a string");
