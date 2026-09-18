@@ -32,6 +32,19 @@ class ConcurrencyAxesTests(unittest.TestCase):
         self.assertTrue(parsed.get("longctx_unmeasured"))
         self.assertFalse(parsed.get("guardmo_failed"))
 
+    def test_an_unmeasured_guard_retries_instead_of_rejecting(self):
+        # 2026-09-18: one round produced no Muse concurrent rows, and "measurement unavailable"
+        # was treated as a guard failure -- REJECT, then auto-closed -- on two PRs that had just
+        # measured +10% on the 256k axis. An absent measurement is infra: retry, never reject.
+        src = open(bot.__file__).read()
+        self.assertIn('unavailable = [p for p in problems if p.endswith("measurement unavailable")]', src)
+        self.assertIn("re-evaluated next round rather than rejected", src)
+        # The coverage line makes a missing guard visible in the round log.
+        self.assertIn("main guard coverage", src)
+        self.assertIn("PR guard coverage", src)
+        self.assertEqual(bot._guard_coverage({"guardmo": {32768: {}}, "guardcbmo": {16: {}, 32: {}}}),
+                         "modelopt 1 ctx / 2 cc · muse 0 ctx / 0 cc · qwen3.6 0 ctx")
+
     def test_schema_is_bumped_so_old_verdicts_re_evaluate(self):
         self.assertNotEqual(bot.EVAL_SCHEMA_VERSION, "v1-nvfp4-decode128")
         self.assertIn(bot.EVAL_SCHEMA_VERSION, bot.MARKER_RE.pattern.replace("\\", ""))

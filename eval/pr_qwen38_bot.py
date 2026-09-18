@@ -1374,6 +1374,14 @@ def _merge_ref_exists(repo: str, num: int) -> bool:
     return r.returncode == 0 and bool((r.stdout or "").strip())
 
 
+def _guard_coverage(d: dict) -> str:
+    """One line naming how many rows each guard produced -- a guard that measured nothing is the
+    difference between a REJECT and a retry, so the round log should not make anyone guess."""
+    return (f"modelopt {len(d.get('guardmo') or {})} ctx / {len(d.get('guardcbmo') or {})} cc · "
+            f"muse {len(d.get('guardmg') or {})} ctx / {len(d.get('guardcbmg') or {})} cc · "
+            f"qwen3.6 {len(d.get('guard36') or {})} ctx")
+
+
 def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
     already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
@@ -1407,6 +1415,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     print(f">> PR decode@128={pr['decode128_tps']:.2f} prefill@128={pr['prefill128_pp']:.2f} "
           f"prefill@16k={pr['prefill16k_pp']:.2f} cb {_cb_summary(pr)} "
           f"top1={pr.get('top1', 0):.4f} kl={pr.get('kl', 99):.5f}")
+    print(f">> PR guard coverage: {_guard_coverage(pr)}")
 
     # THREE scored dimensions on the NVFP4 checkpoint, all from the one model load (module
     # docstring pt. 1). Same rule pr_museglimmer_bot.py uses for its two, generalised rather than
@@ -1502,6 +1511,18 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         if skipped:
             print(f">> {name} guard SKIPPED — checkpoint not installed on the box")
         if not ok:
+            # A guard that measured NOTHING is infra, not a regression. Take the same retry path a
+            # failed bench run takes -- label null, no verdict posted, re-evaluated next round --
+            # instead of closing a PR over a measurement that never happened. On 2026-09-18 one
+            # round's missing Muse concurrent rows produced `muse glimmer concurrent guard
+            # measurement unavailable` and auto-closed #1112 and #1114, both of which had just
+            # measured +10% on the 256k axis; the guard itself ran fine by hand minutes later.
+            unavailable = [p for p in problems if p.endswith("measurement unavailable")]
+            if unavailable and len(unavailable) == len(problems):
+                return {"ok": False,
+                        "reason": "; ".join(unavailable) + " — infra, not a regression; the PR is "
+                                  "re-evaluated next round rather than rejected",
+                        "log": ""}
             reason = f"{name} no-regression guard failed: " + "; ".join(problems[:6]) + f" | {reason}"
             label = "REJECT"
             passed = False
@@ -2125,6 +2146,7 @@ def main():
     print(f">> main baseline: decode@128={main_result['decode128_tps']:.2f} tok/s "
           f"prefill@128={main_result['prefill128_pp']:.2f} pp "
           f"prefill@16k={main_result['prefill16k_pp']:.2f} pp cb {_cb_summary(main_result)}")
+    print(f">> main guard coverage: {_guard_coverage(main_result)}")
 
     for num, head, short, ref, title in pending:
         print(f"PR #{num} @ {short}: evaluating Qwen3.8-27B '{ref}' …")
