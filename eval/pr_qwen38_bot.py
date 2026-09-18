@@ -1332,6 +1332,17 @@ def measure_main_baseline(host, port):
     return main
 
 
+def _merge_ref_exists(repo: str, num: int) -> bool:
+    """Does GitHub publish refs/pull/<num>/merge? It does for a mergeable PR, and drops it while the
+    PR conflicts with the base, so this doubles as the conflict check."""
+    try:
+        r = subprocess.run(["git", "ls-remote", f"https://github.com/{repo}", f"refs/pull/{num}/merge"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return False
+    return r.returncode == 0 and bool((r.stdout or "").strip())
+
+
 def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
     """Run the PR ref's speed+accuracy script on the same box and compare against `main`, an
     already-measured baseline shared across every PR in the round (see measure_main_baseline)."""
@@ -2014,7 +2025,14 @@ def main():
         else:
             print(f"PR #{num}: --only-prs targeted")
 
-        ref = f"pull/{num}/head"
+        # Evaluate the PR MERGED INTO main, not its branch tip. The harness is pinned from main
+        # (so a PR cannot rewrite the thing that measures it), and a branch that predates a struct
+        # change on main therefore builds main's harness against its own older headers: on
+        # 2026-09-18 every PR branched before 8d55f3f ("window_tokens" in KVCacheConfig) failed with
+        # BUILD_FAILED and scored eval:REJECT with no measurements at all -- #1109 among them, one
+        # commit behind. The merge ref is also the tree that would actually land. GitHub publishes
+        # it only for a mergeable PR; a conflicted one still measures at its head, as before.
+        ref = f"pull/{num}/merge" if _merge_ref_exists(args.repo, num) else f"pull/{num}/head"
         pending.append((num, head, short, ref, pr.get("title", "")))
 
     if not pending:
