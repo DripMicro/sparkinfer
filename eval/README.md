@@ -206,8 +206,21 @@ applies `eval-qwen38:{XL,L,M,S,XS,none,REJECT}`, derives the generic `eval:*` ti
        build/runtime/qwen3_gguf_cb_bench <checkpoint> N 256 256 512
      ```
 
-   `decode@128`, `prefill@128` and `cb-decode@c1` are measured as floors. Any measured dimension
-   below 98% of `main` is a hard REJECT.
+   - **long-context decode `modelopt-decode@256k`** (issue #1113): one 262144-token row on the
+     ModelOpt NVFP4 checkpoint — the checkpoint the axis was defined on in `pr_dspark_bot.py`, and
+     the only one that fits a 32 GB card at that context (30.0 GB peak; the unsloth weights this
+     bot otherwise scores are 22 GB before any KV). It runs as its own sweep tier because
+     `bench_sweep_run` applies one rep count per call:
+
+     ```bash
+     bench_sweep_run "$MODELOPT_GUARD_MODEL_DIR" 128 262144 3
+     ```
+
+     A checkpoint that is absent, or a sweep that fails, leaves the axis unscored for that round —
+     it is never a rejection.
+
+   `decode@128`, `prefill@128`, `modelopt-prefill@256k` and `cb-decode@c1` are measured as floors.
+   Any measured dimension below 98% of `main` is a hard REJECT.
 
    This checkpoint's packed decode step runs FP8 and Q4_K kernels that the ModelOpt checkpoint never
    uses, and no other bot measures concurrency on it. `main` (`507017b`), aggregate tok/s:

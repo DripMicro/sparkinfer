@@ -15,6 +15,23 @@ class ConcurrencyAxesTests(unittest.TestCase):
         self.assertIn("prefill@16k", bot.SCORING_DIMS)
         self.assertNotIn("decode@128", bot.SCORING_DIMS)
 
+    def test_long_context_decode_is_scored_and_its_prefill_is_a_floor(self):
+        # Issue #1113: decode@256k was defined in pr_dspark_bot.py but measured by no active bot,
+        # so a change that only moves long-context decode scored "none" and was auto-closed.
+        self.assertIn(bot.LONGCTX_DECODE_DIM, bot.SCORING_DIMS)
+        self.assertNotIn(bot.LONGCTX_PREFILL_DIM, bot.SCORING_DIMS)
+        self.assertEqual(bot.LONGCTX_CTX, 262144)
+        script = bot._remote_script("main", role="main")
+        # Its own sweep call: bench_sweep_run applies one rep count per call, so sharing the 5-rep
+        # guard call would cost five 60 s rows.
+        self.assertIn(f'bench_sweep_run "$MODELOPT_GUARD_MODEL_DIR" 128 {bot.LONGCTX_CTX} {bot.LONGCTX_REPS}', script)
+        self.assertIn(f'echo "GUARDMO {bot.LONGCTX_CTX} ', script)
+        # A missing or failed 256k sweep leaves the axis unscored; it never rejects a PR.
+        self.assertIn("LONGCTX_FAILED", script)
+        parsed = bot._parse_remote("LONGCTX_FAILED\n")
+        self.assertTrue(parsed.get("longctx_unmeasured"))
+        self.assertFalse(parsed.get("guardmo_failed"))
+
     def test_schema_is_bumped_so_old_verdicts_re_evaluate(self):
         self.assertNotEqual(bot.EVAL_SCHEMA_VERSION, "v1-nvfp4-decode128")
         self.assertIn(bot.EVAL_SCHEMA_VERSION, bot.MARKER_RE.pattern.replace("\\", ""))
@@ -180,7 +197,8 @@ class ConcurrencyGuardTests(unittest.TestCase):
         for marker in ("GUARDCBMO $CC $CB_AGG", "GUARDCBMO_FAILED $CC", "GUARDCBMG $CC $CB_AGG", "GUARDCBMG_FAILED $CC"):
             self.assertIn(marker, script)
         self.assertLess(script.index("GUARDCBMG_FAILED"), script.index('echo "GUARD_END"'))
-        self.assertIn("v4", bot.EVAL_SCHEMA_VERSION)
+        # The schema names the axis set; it moved to v5 when decode@256k joined (#1113).
+        self.assertIn("cross-model-guards-cb", bot.EVAL_SCHEMA_VERSION)
 
     def test_cb_median_returns_instead_of_exiting(self):
         script = bot._remote_script("main", role="main")

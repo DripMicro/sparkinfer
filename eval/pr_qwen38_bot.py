@@ -33,6 +33,9 @@ becomes the eval scope (see eval/README.md). Narrowly scoped on purpose:
               actually takes is measured correctly even while the absolute number is unflattering.
 
   1b. Concurrent decode — cb-decode@c2/c4/c8/c16/c32 scored, cb-decode@c1 a floor (issue #1080).
+  1c. Long-context decode — ModelOpt NVFP4 decode@256k scored, prefill@256k a floor (issue #1113).
+      One 262144-token row, its own rep tier, on the checkpoint the axis was defined on: the
+      unsloth weights this bot otherwise scores do not leave room for a 256K KV cache.
               Aggregate tok/s with N requests in flight through ContinuousBatchEngine
               (qwen3_gguf_cb_bench: N 256-token prompts, 256 tokens each, and one 512-token
               prefill injected mid-batch), measured exactly as pr_dspark_bot.py measures its
@@ -162,7 +165,16 @@ CB_REPS = 3
 # Runs allowed per width before the round fails as infra: CB_REPS complete ones plus two partial.
 CB_MAX_ATTEMPTS = 5
 CB_DIM_FOR = {c: f"cb-decode@c{c}" for c in CB_CONCS}
-SCORING_DIMS = [SCORING_DIM] + [CB_DIM_FOR[c] for c in CB_SCORED_CONCS]
+# Long-context decode, its own sweep tier (#1113). bench_sweep_run applies ONE rep count to a whole
+# call -- the max across its (ctx, reps) pairs -- so 256k cannot share the 5-rep guard call without
+# costing five 60 s rows. It is measured on the ModelOpt NVFP4 checkpoint because that is the
+# checkpoint the axis was defined on (pr_dspark_bot.py's target-decode@256k) and the only one that
+# fits: 30.0 GB peak, against 22 GB of unsloth weights before any KV.
+LONGCTX_CTX = 262144
+LONGCTX_REPS = 3
+LONGCTX_DECODE_DIM = "modelopt-decode@256k"
+LONGCTX_PREFILL_DIM = "modelopt-prefill@256k"
+SCORING_DIMS = [SCORING_DIM] + [CB_DIM_FOR[c] for c in CB_SCORED_CONCS] + [LONGCTX_DECODE_DIM]
 
 # The measuring instrument. A PR touching any of these is not evaluated, and every ref -- main
 # included -- is built with main's copy of them (see the HARNESS_PINNED block in _remote_script).
@@ -195,7 +207,7 @@ QWEN38_NEEDS_REBASE = "qwen38-needs-rebase"
 # v2 (2026-09-15): concurrent-decode axes added (issue #1080), and the harness is taken from main.
 # v3 (2026-09-15): ModelOpt Qwen3.8 and Muse Glimmer no-regression guards added.
 # v4 (2026-09-15): those guards also cover concurrent decode at c16/c32.
-EVAL_SCHEMA_VERSION = "v4-unsloth-concurrency-cross-model-guards-cb"
+EVAL_SCHEMA_VERSION = "v5-unsloth-concurrency-cross-model-guards-cb-longctx256k"
 MARKER_RE = re.compile(
     r"<!-- sparkinfer-qwen38-eval:" + re.escape(EVAL_SCHEMA_VERSION) + r":([0-9a-f]+)(?:\s+(\{.*?\}))? -->",
     re.DOTALL,
@@ -685,6 +697,7 @@ def _remote_script(ref: str, role: str = "pr") -> str:
     muse_gguf = shlex.quote(MUSE_GUARD_GGUF)
     mo_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in MODELOPT_GUARD_CTXS)
     mo_ctx_list = " ".join(str(c) for c in MODELOPT_GUARD_CTXS)
+    lc_ctx, lc_reps = LONGCTX_CTX, LONGCTX_REPS
     mg_sweep_args = " ".join(f"{c} {GUARD_REPS}" for c in MUSE_GUARD_CTXS)
     mg_ctx_list = " ".join(str(c) for c in MUSE_GUARD_CTXS)
     cb_guard_concs = " ".join(str(c) for c in CB_GUARD_CONCS)
@@ -1005,6 +1018,20 @@ else
   echo "GUARDMO_UNAVAILABLE"
 fi
 
+# --- long-context decode, ModelOpt NVFP4 @ 256k (#1113) ---
+# Its own sweep call, and its own rep count: one row fills the 262144-token context, ~60 s, 30.0 GB
+# peak. A failure here is NOT a guard failure -- the axis simply goes unscored for this round.
+if [ -d "$MODELOPT_GUARD_MODEL_DIR" ]; then
+  wait_gpu_clear
+  if bench_sweep_run "$MODELOPT_GUARD_MODEL_DIR" 128 {lc_ctx} {lc_reps}; then
+    echo "GUARDMO {lc_ctx} $(_bench_sweep_get {lc_ctx} decode_tps) $(_bench_sweep_get {lc_ctx} prefill_pp)"
+  else
+    echo "LONGCTX_FAILED"
+  fi
+else
+  echo "LONGCTX_UNAVAILABLE"
+fi
+
 # --- Muse Glimmer 30B no-regression guard (decode + prefill @ 32k) ---
 # The model pr_museglimmer_bot.py scores, measured the way that bot measures it: qwen3_gguf_bench
 # on the GGUF with no env pins. Skipped, not failed, when the GGUF is absent from the box.
@@ -1140,6 +1167,10 @@ def _parse_remote(stdout: str) -> dict:
                     pass
         elif line.strip() in ("GUARDMO_FAILED", "GUARDMG_FAILED"):
             out[line.strip().split("_")[0].lower() + "_failed"] = True
+        elif line.strip() in ("LONGCTX_FAILED", "LONGCTX_UNAVAILABLE"):
+            # Soft: the 256k axis is not scored this round. Never a guard failure -- a checkpoint
+            # that is absent, or a sweep that could not fit, must not reject a PR (#1113).
+            out["longctx_unmeasured"] = True
         elif line.strip() in ("GUARDMO_UNAVAILABLE", "GUARDMG_UNAVAILABLE"):
             out[line.strip().split("_")[0].lower() + "_unavailable"] = True
     out["guard36"] = guard36
@@ -1390,6 +1421,14 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         ("prefill@128", pr["prefill128_pp"],   main["prefill128_pp"]),
         ("prefill@16k", pr["prefill16k_pp"],   main["prefill16k_pp"]),
     ] + [(CB_DIM_FOR[c], pr[f"cb{c}_agg"], main[f"cb{c}_agg"]) for c in CB_CONCS]
+    # Long-context decode (#1113): scored, with its prefill a floor beside it, exactly as the other
+    # tiers work. Both arms must have measured it -- a round where the sweep did not run scores the
+    # PR on everything else rather than inventing a number.
+    lc_pr = (pr.get("guardmo") or {}).get(LONGCTX_CTX) or {}
+    lc_main = (main.get("guardmo") or {}).get(LONGCTX_CTX) or {}
+    if lc_pr.get("decode") and lc_main.get("decode"):
+        dims = dims + [(LONGCTX_DECODE_DIM, lc_pr["decode"], lc_main["decode"]),
+                       (LONGCTX_PREFILL_DIM, lc_pr["prefill"], lc_main["prefill"])]
     scored = []
     for name, pr_v, main_v in dims:
         lab, dlt, ok, why = tier_from_gain(pr_v, main_v, metric=name)
@@ -1411,7 +1450,7 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         # concurrent width. An improvement to a floor alone (decode@128, prefill@128, c1) scores
         # "none" by design. max() over deltas rather than tier letters, as pr_dspark_bot.py does:
         # two dimensions can share a bucket while one is clearly the larger win.
-        best = max((by_dim[d] for d in SCORING_DIMS), key=lambda s: s["delta"])
+        best = max((by_dim[d] for d in SCORING_DIMS if d in by_dim), key=lambda s: s["delta"])
         label, delta_pct, passed, speed_reason = best["label"], best["delta"], best["passed"], best["reason"]
     decode_label,  decode_delta_pct  = by_dim["decode@128"]["label"],  by_dim["decode@128"]["delta"]
     prefill_label, prefill_delta_pct = by_dim["prefill@128"]["label"], by_dim["prefill@128"]["delta"]
@@ -1478,6 +1517,9 @@ def eval_qwen38_on_box(host, port, pr_ref: str, main: dict):
         "main_decode_tps": main["decode128_tps"],
         "decode_delta_pct": decode_delta_pct,
         "decode_regressed": decode_label == "REJECT",
+        "pr_decode256k_tps": (lc_pr.get("decode") or 0.0) or None,
+        "main_decode256k_tps": (lc_main.get("decode") or 0.0) or None,
+        "decode256k_delta_pct": by_dim[LONGCTX_DECODE_DIM]["delta"] if LONGCTX_DECODE_DIM in by_dim else None,
         "pr_prefill_pp": pr["prefill128_pp"],
         "main_prefill_pp": main["prefill128_pp"],
         "prefill_delta_pct": prefill_delta_pct,
@@ -1598,11 +1640,17 @@ def format_comment(commit: str, res: dict) -> str:
         polaris_row = "| Polaris receipt | collected, not signed (no key configured) |\n"
     else:
         polaris_row = ""
+    # Long-context decode is only reported when both arms measured it (#1113).
+    longctx_row = ""
+    if res.get("pr_decode256k_tps") and res.get("main_decode256k_tps"):
+        longctx_row = (f"| decode@256k (ModelOpt NVFP4) | PR {res['pr_decode256k_tps']:.2f} / "
+                       f"main {res['main_decode256k_tps']:.2f} tok/s "
+                       f"({res.get('decode256k_delta_pct', 0):+.1f}%) |\n")
     return (
         f"{marker}\n## sparkinfer qwen38 auto-eval — `eval-qwen38:{lab}`\n\n"
         f"| metric | value |\n|---|---|\n"
         f"| **label** | `eval-qwen38:{lab}` |\n"
-        f"| scored at | best of prefill@16k and concurrent decode @c2/c4/c8/c16/c32; decode@128, prefill@128 and concurrent decode @c1 are no-regression floors |\n"
+        f"| scored at | best of prefill@16k, concurrent decode @c2/c4/c8/c16/c32 and ModelOpt decode@256k; decode@128, prefill@128, prefill@256k and concurrent decode @c1 are no-regression floors |\n"
         f"| tier came from | `{res.get('scored_dimension', '?')}` |\n"
         f"| PR decode tok/s | {res['pr_decode_tps']:.2f} |\n"
         f"| main decode tok/s | {res['main_decode_tps']:.2f} |\n"
@@ -1613,6 +1661,7 @@ def format_comment(commit: str, res: dict) -> str:
         f"| PR prefill@16k pp | {res['pr_prefill16k_pp']:.2f} |\n"
         f"| main prefill@16k pp | {res['main_prefill16k_pp']:.2f} |\n"
         f"| prefill@16k vs main | {res.get('prefill16k_delta_pct', 0):+.1f}% |\n"
+        f"{longctx_row}"
 
         f"{acc_row}"
         f"{main_acc_note}"
