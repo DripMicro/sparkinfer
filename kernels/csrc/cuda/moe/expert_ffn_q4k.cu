@@ -849,6 +849,56 @@ __global__ void gate_up_q3a_muse_kernel(
     if (pdl) si_pdl_lc();
 }
 
+// Contextual-sparsity twin of gate_up_q3a_muse_kernel. The Q4_K gate/up already skips the up
+// read when |silu(gate)| < tau (gate_up_mmvq2_qwen_sparse_kernel); the 42 Q3_A layers never
+// reached that arm. Same mask, same reduction: gate first, broadcast silu to every thread,
+// then either write 0 or read up. SPARKINFER_MUSE_Q3A_SPARSE=0 restores the dense kernel.
+template <int H, int F>
+__global__ void gate_up_q3a_muse_sparse_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    float* __restrict__ h_scratch, float tau, int pdl
+) {
+    constexpr int NW = 4, NB = H >> 8;
+    const int f = blockIdx.x;
+    const int e = expert_ids[0];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
+    const int kbx0 = tid >> 4, kqs = 2 * (tid & 15);
+    const si_block_q3_A* g_row = reinterpret_cast<const si_block_q3_A*>(gate_q + ((size_t)e * F + f) * NB * sizeof(si_block_q3_A));
+    const si_block_q3_A* u_row = reinterpret_cast<const si_block_q3_A*>(up_q + ((size_t)e * F + f) * NB * sizeof(si_block_q3_A));
+    __shared__ float sred[NW];
+    float tg = 0.f;
+    #pragma unroll
+    for (int kbx = kbx0; kbx < NB; kbx += 8)
+        tg += si_vec_dot_q3_A(g_row + kbx, vy + (size_t)kbx * 8, kqs);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tg += __shfl_xor_sync(0xffffffff, tg, m);
+    if (lane == 0) sred[warp] = tg;
+    __syncthreads();
+    float tgf = 0.f;
+    #pragma unroll
+    for (int w = 0; w < NW; w++) tgf += sred[w];
+    const float g = q4kf_silu(tgf);
+    float hval = 0.f;
+    if (fabsf(g) >= tau) {
+        float tu = 0.f;
+        #pragma unroll
+        for (int kbx = kbx0; kbx < NB; kbx += 8)
+            tu += si_vec_dot_q3_A(u_row + kbx, vy + (size_t)kbx * 8, kqs);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) tu += __shfl_xor_sync(0xffffffff, tu, m);
+        __syncthreads();
+        if (lane == 0) sred[warp] = tu;
+        __syncthreads();
+        float tuf = 0.f;
+        #pragma unroll
+        for (int w = 0; w < NW; w++) tuf += sred[w];
+        hval = g * tuf;
+    }
+    if (tid == 0) h_scratch[f] = hval;
+    if (pdl) si_pdl_lc();
+}
+
 // MULTI-ROW form of gate_up_q3a_muse_kernel. gate_up_q3a_kernel grids (token, f) as
 // `row = blockIdx.x; ts = row / F; f = row % F`, so f is the FAST index and the N CTAs that share
 // an output row's weights sit F = 19968 blocks apart in the grid -- they never co-reside, and
@@ -3047,9 +3097,30 @@ void launch_moe_expert_ffn_q4k(
             // SPARKINFER_MUSE_Q3A_ROWS=0 sends a multi-row batch back to the per-token grid.
             static int q3_rows = -1;
             if (q3_rows < 0) { const char* e = getenv("SPARKINFER_MUSE_Q3A_ROWS"); q3_rows = (e && e[0] == '0') ? 0 : 1; }
-            if (q3_spec && num_tokens == 1 && top_k == 1 && hidden == 6656 && ffn == 19968)
-                launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, gate_up_q3a_muse_kernel<6656, 19968>,
-                    q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            if (q3_spec && num_tokens == 1 && top_k == 1 && hidden == 6656 && ffn == 19968) {
+                // SPARKINFER_MUSE_Q3A_SPARSE=0 keeps the dense one-row kernel (main). Tau
+                // defaults to the Q4_K sparse arm's value; SPARKINFER_MUSE_Q3A_SPARSE_TAU
+                // overrides it without touching those ten layers.
+                static int q3_sparse = -1;
+                if (q3_sparse < 0) {
+                    const char* e = getenv("SPARKINFER_MUSE_Q3A_SPARSE");
+                    q3_sparse = (e && e[0] == '0') ? 0 : 1;
+                }
+                mg_sparse_ffn_init();
+                static float q3_tau = -1.f;
+                if (q3_tau < 0.f) {
+                    const char* e = getenv("SPARKINFER_MUSE_Q3A_SPARSE_TAU");
+                    // 0.08 is the measured decode peak on the 42 Q3_A layers; 0.06 is the
+                    // Q4_K sparse default. SPARKINFER_MUSE_Q3A_SPARSE_TAU=0.06 matches that arm.
+                    q3_tau = e ? (float)atof(e) : 0.08f;
+                }
+                if (q3_sparse && q3_tau > 0.f)
+                    launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, gate_up_q3a_muse_sparse_kernel<6656, 19968>,
+                        q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, q3_tau, gu_pdl);
+                else
+                    launch_pdl_kernel(gu_pdl, dim3(19968), dim3(4 * 32), 0, stream, gate_up_q3a_muse_kernel<6656, 19968>,
+                        q, reinterpret_cast<const unsigned char*>(gate_q), reinterpret_cast<const unsigned char*>(up_q), expert_ids, h_scratch, gu_pdl);
+            }
             else if (q3_rows && num_tokens > 1 && top_k == 1 && hidden == 6656 && ffn == 19968) {
                 // Chunked at the register width the multi-row body carries. Wider than 8 rows the
                 // per-row accumulators start to spill, and 8 already turns the per-token weight
