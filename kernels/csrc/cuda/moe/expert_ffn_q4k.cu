@@ -1990,6 +1990,27 @@ static inline bool launch_down_q6k_mmvq_splitk(
             return true;
         }
     }
+    // Muse Glimmer dense 6656x19968: same specialized split-K body Qwythos already had at
+    // 4096x12288 (compile-time NBLK=78, unrolled K walk). The generic kernel takes F at runtime
+    // so ptxas cannot unroll the 10 super-blocks each S=8 split owns. Add order is still
+    // split, split+S, ... -- SPARKINFER_DOWN_SPEC=0 restores the generic kernel (A/B in ONE binary).
+    if (spec && top_k == 1 && F == 19968) {
+        if (S == 8) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<8, 78, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+        if (S == 4) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<4, 78, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+        if (S == 2) {
+            launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_qwen_kernel<2, 78, 1>,
+                down_q, expert_ids, expert_weights, hq8, output, H, pdl);
+            return true;
+        }
+    }
     switch (S) {
         case 2: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<2>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
         case 4: launch_mmvq_down_kernel(pdl, grid, block, stream, down_q6k_mmvq_splitk_kernel<4>, down_q, expert_ids, expert_weights, hq8, output, H, F, top_k, pdl); return true;
