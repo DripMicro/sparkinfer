@@ -3372,24 +3372,22 @@ static bool muse_packed_on() {
     }();
     return v;
 }
-// Row count from which a packed step runs the dense gate/up as ONE block-scaled NVFP4 GEMM per
-// projection instead of the row-batched dp4a GEMV. The crossover was FITTED rather than swept --
-// "the GEMV costs a fixed read plus ~0.76 ms per row across the model, the GEMM 6.92 ms flat, so
-// they cross just under six rows" -- and measuring it end to end puts it lower. Four packed rows
-// already pay for the GEMM; two do not:
+// Row count from which a packed Muse sandwich step runs dense gate/up as one block-scaled NVFP4
+// GEMM per projection instead of the row-batched Q3_A GEMV. The in-tree comment used to say two
+// rows lose (c2 −7.4% vs GEMV) and four rows are the floor. That was before the transposed GEMM
+// + QKVG landing. On the scored Muse CB path (qwen3_gguf_cb_bench, bf16 KV — the eval bot does
+// not set SPARKINFER_KV_INT8; no SPARKINFER_DOWN_SPEC) the crossover is now two:
 //
-//     c=4   min_rows 6 -> 191.6 / 191.2 tok/s     min_rows 2 -> 208.7 / 208.8   +9.0%
-//     c=2   min_rows 6 -> 137.1 / 137.1           min_rows 2 -> 126.9           -7.4%
+//     same-binary RTX 5090 @400W, interleaved, SPARKINFER_GU_GEMM_MIN_ROWS=
+//       c2  4=GEMV 159.8/159.4/159.2 vs 2=GEMM 176.9/176.6/175.8  +10.6%
+//       c4  338.3 vs 338.3  (already GEMM at the old floor of 4)
+//       c8  634.2 vs 633.2  (already GEMM)
 //
-// So the GEMM is worth taking from four rows up and not below, which is what this returns. A
-// four-row packed step is a scored continuous-batch width, and at four rows every other arm in the
-// step is still on the dp4a path -- every tensor-core arm has an eight-row floor, because an
-// m16n8k32 tile pads M to sixteen. This is the one place a narrow batch can reach the tensor cores,
-// and the fitted six was keeping it off them.
+// SPARKINFER_GU_GEMM_MIN_ROWS=4 restores origin/main. Muse-only call site (sandwich packed FFN).
 static int gu_gemm_min_rows() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_GU_GEMM_MIN_ROWS");
-        const int x = e ? atoi(e) : 4;
+        const int x = e ? atoi(e) : 2;
         return x < 1 ? 1 : x;
     }();
     return v;
