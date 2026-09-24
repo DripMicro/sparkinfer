@@ -5,6 +5,33 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+**Ternary-Bonsai-2-27B loads and runs**, a 1.75-bit ternary quantization of Qwen3.8-27B whose
+weights live in a rotated basis. Teacher-forced over 107 positions of prose it scores PPL 8.07
+against the unquantized checkpoint's 4.46 through the same runtime.
+
+### Models
+
+- **PTQ1_0, the ternary weight format** (#1124). Trits packed 128 to a 28-byte block with one FP16
+  scale, read in ggml's TQ1_0 order: carrier bytes are walked in two runs and each emits its trits
+  position-major. Reading them carrier-major decodes every value correctly and puts every one in
+  the wrong place, which no round-trip test can see because it packs with the order it unpacks.
+- **The checkpoint's Hadamard rotation is folded into the weights at load** (#1124). Each rotated
+  row is stored as `R.W[o]`; un-rotating with `R^-1 = diag(s).H` is the same arithmetic moved to
+  the other operand and leaves an ordinary model, so no graph needs a rotation inserted and every
+  existing kernel applies unchanged. `token_embd` un-rotates like the rest — the metadata's
+  `inverse_weight_names` describes a runtime obligation, not a storage direction.
+- **The GDN v heads are regrouped** (#1124). Everything producing a v head — `attn_qkv`'s v rows,
+  `attn_gate`, `ssm_conv1d`'s v channels, `ssm_a`, `ssm_dt.bias`, `ssm_alpha`, `ssm_beta` — stores
+  its 48 heads transposed, while `ssm_out`, which consumes them, does not. The loader puts the
+  producers back in the architecture's order, and `gdn_qh_block` now follows from the GGUF side as
+  it already did from the safetensors side: that pairing was cyclic for every GGUF of this family,
+  so each v head was driven by the wrong q/k head.
+- **BF16 tensors are sized and dequantized** (#1124). Type 30 had no entry in the GGUF block table,
+  so every BF16 tensor sized to nothing and surfaced as a device allocation failing on an unrelated
+  name much later.
+- **Q4_K's `d` is kept a normal fp16** (#1124). It is 1/63 of the weights it describes, so any
+  group scale below ~3.8e-3 drove it subnormal and the writer flushed it to zero.
+
 ### Fixed
 
 - **A failed CUDA-graph capture was marked ready, and a destroyed decode graph kept its handles.**
@@ -15,6 +42,61 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   capture declines to the per-row path, which loses nothing because capture records rather than
   runs. Once the CUDA context is lost, a request gets a 503 before any device work, rather than the
   prefix-cache handling issuing graph destroys against the dead context.
+
+### Serving
+
+- **Ternary weights can be read in their stored form** (#1124), behind
+  `SPARKINFER_BONSAI_NATIVE` (`head`, `embed`, `proj`, or `all`). Folding the rotation into the
+  weights is exact but leaves them dense, so a 5.95 GB checkpoint occupies ~18 GB; reading the
+  28-byte blocks directly costs 0.21875 bytes/weight and rotates the activation instead. The LM
+  head, the embedding table and the residual-width projections take that path, and it is slightly
+  *better* than folding -- PPL 7.89 against 8.07-8.10 -- because the trits are read as they are
+  rather than refitted to Q4_K. Decode rotates the activation once per layer before the
+  projections fan out across streams; prefill keeps its existing branches by getting ordinary
+  bf16 out of one `dq()` helper, so only the scratch is dense.
+
+  `ffn` takes the dense SwiGLU too -- the largest thing still being expanded, ~5.9 GB of the
+  checkpoint. Its decode arm is three GEMVs and an elementwise SwiGLU, the shape the NVFP4 arm
+  beside it already uses, because the fused Q4_K expert kernel cannot read type 143 at all. It
+  needs TWO rotations where a projection needs one: gate and up read the post-attention norm at
+  the residual width, down reads SwiGLU's output at the FFN width, which is a different sign
+  vector. All three legs convert together or none do -- a down leg left as Q4_K beside native
+  gate/up would read a correctly-rotated activation against un-rotated weights.
+
+  **Off by default.** Measured on an RTX 5090, every configuration answering correctly:
+
+  | `SPARKINFER_BONSAI_NATIVE` | VRAM | single-stream | 4 concurrent | PPL |
+  | --- | --- | --- | --- | --- |
+  | unset (folded) | 17.9 GB | 87.4 tok/s | 214.4 tok/s | 6.946 |
+  | `head,embed,proj` | 13.6 GB | 60.0 tok/s | 64.0 tok/s | 6.449 |
+  | `all` | **8.2 GB** | 29.8 tok/s | 82.7 tok/s | **6.342** |
+
+  (perplexities on one passage, all three from the same build so they compare; the regression
+  guard scores a longer one and reads 9.709 folded against 9.187 for `all`)
+
+  So it is less than half the memory and the best-scoring of the three, at 2.9x the single-stream
+  cost and 2.6x at concurrency. It is a real option for a card that cannot hold 18 GB at all, and
+  the wrong default for one that can.
+- **Packed continuous-batch decode drives the ternary path** (#1124), which took it from 34.3 to
+  82.7 tok/s at four concurrent requests. It used to decline on every step -- correct, since a
+  declined batch falls back to one forward per row, but it meant concurrency bought almost
+  nothing. Three arms were needed, because the packed path prepares activations three ways: the
+  projections, the dense FFN and the LM head. The rotation is staged once per layer ahead of the
+  stream fork and both the main- and side-stream projection helpers read it, which is the rule
+  the dp4a and fp8 activation staging beside it already follows -- a side stream rotating for
+  itself is a write racing the main stream's read. All of it goes through one batched GEMM that
+  is bit-identical per row to the single-row GEMV AR decode drives.
+- **The ternary GEMV stops paying local memory for every trit.** `pow3[m]` was a function-local
+  array indexed by a value that differs across the lanes of a warp, so it could not stay in
+  registers and each trit extraction took a local-memory load; and the 28-byte block was re-read
+  from global on each of four unrolled passes as scattered, data-dependent single-byte loads. A
+  select chain and one shared-memory staging per block: 1.9x on the full native path (16.0 to 29.8
+  tok/s single-stream, 17.9 to 34.3 at four concurrent), bit-identical, which
+  `gemv_ptq1_gpu_test` checks against a host decoder and against N separate GEMVs.
+- **The Qwen3.8-27B family is recognised by shape** (#1124), not by the presence of an MTP block.
+  A derivative without one was served under the default model name of an unrelated 35B MoE, and
+  the same flag selects this family's chat-template behaviour and its second stop token (248044),
+  which GGUF metadata cannot carry beside the one `eos_token_id` it has room for.
 
 ## [0.5.11] — 2026-09-24
 

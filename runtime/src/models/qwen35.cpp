@@ -23,12 +23,19 @@
 #include <atomic>
 
 #include <mutex>
+#include <thread>
 #include "sparkinfer/models/dflash_draft.h"
 #include "sparkinfer/models/dflash_kernels.h"
 #include "qwen35_prefill.h"
 #include "sparkinfer/thermal_governor.h"
 #include "sparkinfer/kv_ops.h"
 #include "sparkinfer/gguf.h"
+#include "sparkinfer/ternary_ptq1.h"
+#include "sparkinfer/prism_hadamard.h"
+#include "sparkinfer/gdn_v_regroup.h"
+#include "sparkinfer/kernels/proj_requant.h"
+#include "sparkinfer/kernels/hadamard.h"
+#include "sparkinfer/kernels/ternary.h"
 #include "sparkinfer/safetensors.h"
 #include "sparkinfer/kernels/compressed_tensors.h"
 #include "sparkinfer/kernels/attention.h"
@@ -140,10 +147,281 @@ bool ggml_dequant_supported(int ggml_type) {
         case 12: // Q4_K
         case 13: // Q5_K (UD / dynamic quants mix this in)
         case 14: // Q6_K
+        case 30: // BF16 (Ternary-Bonsai-2 keeps its GDN alpha/beta projections here)
             return true;
         default:
             return false;
     }
+}
+
+// PTQ1_0 (Ternary-Bonsai-2's 1.75-bit weights) has no kernel of its own yet, so it enters the
+// runtime as Q4_K: each trit becomes a nibble either side of the zero point, at 0.34% RMS. Every
+// upload goes through here rather than each call site testing the type, because a path that forgot
+// would read 28-byte ternary blocks as 144-byte Q4_K ones and load whatever followed them.
+struct HostBlocks {
+    const void* data = nullptr;
+    size_t bytes = 0;
+    int ggml_type = 0;
+    std::vector<uint8_t> converted;   // non-empty only when a transcode actually happened
+};
+
+HostBlocks host_blocks_for_upload(const GGUFTensor* t, const std::string& name) {
+    HostBlocks hb;
+    hb.data = t->data;
+    hb.bytes = t->n_bytes;
+    hb.ggml_type = t->ggml_type;
+    if (t->ggml_type != kPtq1GgmlType) return hb;
+
+    // Two 128-trit groups make one 256-element Q4_K superblock, so a row that is a multiple of 128
+    // but not 256 would pair groups across the row boundary and shear every row after the first.
+    if (t->dims[0] % kQ4KBlockElems != 0) {
+        fprintf(stderr, "[gguf] %s: PTQ1_0 row of %ld is not a multiple of %d, cannot transcode\n",
+                name.c_str(), t->dims[0], kQ4KBlockElems);
+        hb.ggml_type = -1;   // fails ggml_dequant_supported at the call site
+        return hb;
+    }
+    const size_t supers = (size_t)t->n_values / kQ4KBlockElems;
+    hb.converted.resize(supers * kQ4KBlockBytes);
+    ptq1_to_q4k(static_cast<const uint8_t*>(t->data), (size_t)t->n_values,
+                         hb.converted.data());
+    hb.data = hb.converted.data();
+    hb.bytes = hb.converted.size();
+    hb.ggml_type = 12;   // Q4_K
+    return hb;
+}
+
+// Folds Ternary-Bonsai-2's Hadamard rotation into the weights at load time.
+//
+// The checkpoint stores every rotated weight row as R.W[o], where R = H.diag(s), and expects the
+// runtime to rotate the activation entering each matmul. Un-rotating the rows instead -- W[o] =
+// R^-1.(stored row), and R^-1 = R^T = diag(s).H -- is the same arithmetic moved to the other
+// operand, and it leaves an ordinary model behind: no graph needs a rotation inserted before its
+// matmuls, and every existing kernel applies unchanged. token_embd is not a special case here;
+// it is a lookup whose rows were rotated for the same reason, so it un-rotates identically.
+//
+// The rotated rows come out dense and Gaussian-ish rather than ternary. Weights that live as
+// quantized blocks are therefore refitted to Q4_K, which spends the ternary structure to buy
+// correctness; a native ternary kernel that rotates activations instead is what keeps it.
+struct UnrotateJob {
+    const GGUFTensor* t = nullptr;
+    const std::vector<int8_t>* sign = nullptr;
+    long width = 0, rows = 0, block = 0;
+    // Every rotated tensor, token_embd included, is stored as R.row and undoes with R^-1: measured
+    // against the un-quantized checkpoint this model was derived from, that recovers the embedding
+    // at cosine 0.89, which is the ternary quantization error and nothing else. The metadata's
+    // inverse_weight_names names a RUNTIME obligation -- token_embd is the one tensor with no
+    // input activation to rotate, so a runtime that rotates activations must instead apply R^-1 to
+    // the row it reads -- not a different storage direction. Kept switchable because that
+    // distinction is easy to get backwards and a wrong guess looks exactly like a bad format read.
+    bool undo_with_forward = false;
+
+    // prism.hadamard.gdn_v_grouped: wherever the GDN v axis is PRODUCED -- attn_qkv's v rows and
+    // the whole of attn_gate -- this checkpoint stores its 48 v-heads transposed, as
+    // [heads_per_group][groups] rather than the [groups][heads_per_group] the architecture reads
+    // them in. ssm_out, which consumes v, is stored in ordinary order, so a loader that ignores
+    // this feeds the gate and the values of one head to another and the layer's output collapses.
+    long v_row0 = -1;        // first row of the v block, negative when the tensor has none
+    long v_rows = 0;         // n_v_heads * head_dim
+    long v_groups = 0;       // ssm.group_count
+    long v_head_dim = 0;
+};
+
+// Destination row -> the row of the stored tensor that belongs there.
+long unrotate_source_row(const UnrotateJob& j, long dst) {
+    if (j.v_row0 < 0 || dst < j.v_row0 || dst >= j.v_row0 + j.v_rows) return dst;
+    const long r = dst - j.v_row0;
+    const long head = r / j.v_head_dim, off = r % j.v_head_dim;
+    const long per_group = (j.v_rows / j.v_head_dim) / j.v_groups;
+    return j.v_row0 + gdn_v_source_head(head, j.v_groups, per_group) * j.v_head_dim + off;
+}
+
+bool bonsai_rot_forward(const char* env, bool def) {
+    const char* v = getenv(env);
+    if (!v || !v[0]) return def;
+    return v[0] == 'f' || v[0] == 'F';   // "fwd" applies R, anything else applies R^-1
+}
+
+// Marks the v block of a tensor that produces GDN v, so its heads get regrouped on the way in.
+void unrotate_job_set_v_block(UnrotateJob& j, const std::string& name, const Qwen35Config& c) {
+    const long head_dim = c.linear_head_dim, v_rows = (long)c.linear_v_heads * head_dim;
+    if (head_dim <= 0 || c.linear_q_heads <= 0 || c.linear_v_heads <= 0) return;
+    if (c.linear_v_heads % c.linear_q_heads != 0) return;   // no clean group split; leave it alone
+    if (name.find(".attn_gate.weight") != std::string::npos) j.v_row0 = 0;
+    else if (name.find(".attn_qkv.weight") != std::string::npos)
+        j.v_row0 = 2 * (long)c.linear_q_heads * head_dim;   // q and k come first, then v
+    else return;
+    if (j.v_row0 + v_rows > j.rows) { j.v_row0 = -1; return; }
+    j.v_rows = v_rows;
+    j.v_groups = c.linear_q_heads;
+    j.v_head_dim = head_dim;
+}
+
+// The same v-head transpose applies to everything else indexed by GDN v head: the per-head
+// scalars ssm_a and ssm_dt.bias, and the alpha/beta projections that emit one value per head.
+// None of those is ternary, so they never pass through the un-rotation; they are regrouped here.
+// Leaving them alone pairs each head's decay and step size with another head's values.
+void* upload_v_regrouped_bf16(const GGUFTensor* t, const std::string& name, long row0,
+                              long heads, long groups, long rows_per_head) {
+    if (heads <= 0 || groups <= 0 || heads % groups != 0 || rows_per_head <= 0) return nullptr;
+    const long row_len = t->n_dims >= 2 ? t->dims[0] : 1;
+    if (row_len <= 0 || t->n_values % row_len != 0) return nullptr;
+    const long rows = t->n_values / row_len;
+    if (row0 < 0 || row0 + heads * rows_per_head > rows) return nullptr;
+    if (t->ggml_type != 0 && t->ggml_type != 30) {
+        fprintf(stderr, "[bonsai] %s: cannot regroup ggml type %d\n", name.c_str(), t->ggml_type);
+        return nullptr;
+    }
+    const long per_group = heads / groups;
+    std::vector<uint16_t> host((size_t)t->n_values);
+    const auto* raw = static_cast<const uint8_t*>(t->data);
+    for (long d = 0; d < rows; ++d) {
+        long src = d;
+        if (d >= row0 && d < row0 + heads * rows_per_head) {
+            const long r = d - row0, h = r / rows_per_head, off = r % rows_per_head;
+            src = row0 + gdn_v_source_head(h, groups, per_group) * rows_per_head + off;
+        }
+        for (long i = 0; i < row_len; ++i) {
+            uint16_t bits;
+            if (t->ggml_type == 30) {
+                std::memcpy(&bits, raw + ((size_t)src * row_len + i) * 2, 2);
+            } else {
+                float f;
+                std::memcpy(&f, raw + ((size_t)src * row_len + i) * 4, 4);
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                u += 0x7FFFu + ((u >> 16) & 1u);
+                bits = (uint16_t)(u >> 16);
+            }
+            host[(size_t)d * row_len + i] = bits;
+        }
+    }
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, host.size() * 2) != cudaSuccess) return nullptr;
+    if (cudaMemcpy(dev, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev);
+        return nullptr;
+    }
+    return dev;
+}
+
+bool unrotate_job_init(UnrotateJob& j, const GGUFTensor* t, const std::string& name,
+                       const std::vector<int8_t>& sign, long block, bool inverse_listed) {
+    j.t = t; j.sign = &sign; j.block = block;
+    j.undo_with_forward = inverse_listed ? bonsai_rot_forward("SPARKINFER_BONSAI_EMB_ROT", false)
+                                         : bonsai_rot_forward("SPARKINFER_BONSAI_W_ROT", false);
+    j.width = t->dims[0];
+    if (j.width <= 0 || t->n_values % j.width != 0) return false;
+    j.rows = t->n_values / j.width;
+    if ((long)sign.size() != j.width || j.width % block != 0 || j.width % kPtq1BlockElems != 0) {
+        fprintf(stderr, "[bonsai] %s: input width %ld does not fit sign vector / block / group\n",
+                name.c_str(), j.width);
+        return false;
+    }
+    return true;
+}
+
+// Decodes rows [r0, r0+nr) of a ternary tensor, un-rotates each, and writes them as bf16.
+void unrotate_rows_to_bf16(const UnrotateJob& j, long r0, long nr, uint16_t* out) {
+    const auto* src = static_cast<const uint8_t*>(j.t->data);
+    const unsigned hw = std::max(1u, std::min(std::thread::hardware_concurrency(), 32u));
+    auto worker = [&](long lo, long hi) {
+        std::vector<float> scratch(j.width);
+        for (long r = lo; r < hi; ++r) {
+            const size_t blk = (size_t)unrotate_source_row(j, r0 + r) * j.width / kPtq1BlockElems;
+            ptq1_dequant(src + blk * kPtq1BlockBytes, (size_t)j.width, scratch.data());
+            if (j.undo_with_forward)
+                hadamard_rotate_activation(scratch.data(), j.width, j.block, j.sign->data());
+            else
+                hadamard_unrotate_activation(scratch.data(), j.width, j.block, j.sign->data());
+            uint16_t* dst = out + (size_t)r * j.width;
+            for (long i = 0; i < j.width; ++i) {
+                uint32_t bits;
+                std::memcpy(&bits, &scratch[i], 4);
+                bits += 0x7FFFu + ((bits >> 16) & 1u);   // round to nearest even on the way to bf16
+                dst[i] = (uint16_t)(bits >> 16);
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    const long per = (nr + hw - 1) / hw;
+    for (unsigned k = 0; k < hw; ++k) {
+        const long lo = std::min<long>(nr, (long)k * per), hi = std::min<long>(nr, lo + per);
+        if (lo < hi) pool.emplace_back(worker, lo, hi);
+    }
+    for (auto& th : pool) th.join();
+}
+
+// Chunked so a 248k-row embedding never needs its whole bf16 expansion resident at once.
+long unrotate_rows_per_chunk(const UnrotateJob& j) {
+    return std::max<long>(1, (64L << 20) / (j.width * 2));
+}
+
+// Reports a CUDA failure against the tensor that caused it. Without this an error here surfaces
+// much later as an unrelated tensor "missing", because every subsequent cudaMalloc inherits it.
+bool unrotate_cuda_ok(const char* what, const std::string& name) {
+    const cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) return true;
+    fprintf(stderr, "[bonsai] %s: %s failed: %s\n", name.c_str(), what, cudaGetErrorString(e));
+    return false;
+}
+
+// Un-rotated weight -> bf16 on device, for the embedding table.
+void* unrotate_ternary_to_bf16(const UnrotateJob& j, const std::string& name) {
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, (size_t)j.t->n_values * 2) != cudaSuccess) {
+        unrotate_cuda_ok("bf16 alloc", name);
+        return nullptr;
+    }
+    const long step = unrotate_rows_per_chunk(j);
+    std::vector<uint16_t> host((size_t)std::min(j.rows, step) * j.width);
+    for (long r0 = 0; r0 < j.rows; r0 += step) {
+        const long nr = std::min(step, j.rows - r0);
+        unrotate_rows_to_bf16(j, r0, nr, host.data());
+        if (cudaMemcpy(static_cast<char*>(dev) + (size_t)r0 * j.width * 2, host.data(),
+                       (size_t)nr * j.width * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+            unrotate_cuda_ok("bf16 upload", name);
+            cudaFree(dev);
+            return nullptr;
+        }
+    }
+    return dev;
+}
+
+// Un-rotated weight -> Q4_K on device, for everything that stays quantized.
+void* unrotate_ternary_to_q4k(const UnrotateJob& j, const std::string& name, cudaStream_t stream) {
+    void* q4k = nullptr;
+    const size_t q4k_bytes = (size_t)(j.t->n_values / kQ4KBlockElems) * kQ4KBlockBytes;
+    if (cudaMalloc(&q4k, q4k_bytes) != cudaSuccess) {
+        unrotate_cuda_ok("q4k alloc", name);
+        return nullptr;
+    }
+    const long step = unrotate_rows_per_chunk(j);
+    std::vector<uint16_t> host((size_t)std::min(j.rows, step) * j.width);
+    void* dev_bf16 = nullptr;
+    if (cudaMalloc(&dev_bf16, host.size() * 2) != cudaSuccess) {
+        unrotate_cuda_ok("staging alloc", name);
+        cudaFree(q4k);
+        return nullptr;
+    }
+
+    bool ok = true;
+    for (long r0 = 0; r0 < j.rows && ok; r0 += step) {
+        const long nr = std::min(step, j.rows - r0);
+        unrotate_rows_to_bf16(j, r0, nr, host.data());
+        const long n_chunk = nr * j.width;
+        if (cudaMemcpy(dev_bf16, host.data(), (size_t)n_chunk * 2,
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            ok = unrotate_cuda_ok("staging upload", name);
+            break;
+        }
+        auto* dst = static_cast<char*>(q4k) +
+                    (size_t)(r0 * j.width / kQ4KBlockElems) * kQ4KBlockBytes;
+        kernels::launch_proj_requant_q4k_lloyd(dev_bf16, dst, n_chunk, stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) ok = unrotate_cuda_ok("q4k refit", name);
+    }
+    cudaFree(dev_bf16);
+    if (!ok) { cudaFree(q4k); return nullptr; }
+    return q4k;
 }
 
 long qwen_moe_meta_int(const GGUF& g, const std::string& key, long def) {
@@ -528,6 +806,31 @@ struct Qwen35Model::Impl {
     // about existing behavior changes unless a caller explicitly opts in via
     // set_lmcache_bridge().
     BridgeClient* lmcache_bridge = nullptr;
+
+    // Ternary-Bonsai-2's rotated basis, kept on the device for the native PTQ1_0 path: the
+    // weights stay in their 28-byte blocks and the ACTIVATION carries the rotation instead of
+    // the weights carrying its inverse. Empty unless the checkpoint declares prism.hadamard and
+    // SPARKINFER_BONSAI_NATIVE is on; the folded path needs none of this.
+    std::unordered_map<long, void*> bonsai_sign_dev;   // input width -> int8[width] on device
+    long bonsai_block = 0;
+    bf16* bonsai_rot = nullptr;                        // scratch for one rotated activation
+    long bonsai_rot_elems = 0;
+    bool bonsai_embed_native = false;                  // token_embd left in its ternary blocks
+    // The layer's normed input, rotated once on the main stream before the projections fan out
+    // across stream_k/stream_v. Rotating inside each projection would race: they run concurrently
+    // and would share one scratch. Written where s.xn is, so s.xn's own visibility carries it.
+    bf16* bonsai_rot_xn = nullptr;
+    // The dense FFN read natively: its input is the POST-ATTENTION norm, not xn, so it needs its
+    // own rotation -- reusing bonsai_rot_xn would feed gate/up the wrong activation. `ffn_h` holds
+    // SwiGLU's output and is rotated in place for the down projection, whose input width is the
+    // FFN width rather than the residual one (17408 against 5120, a different sign vector).
+    bf16* bonsai_rot_hn = nullptr;
+    bf16* bonsai_ffn_gate = nullptr;
+    bf16* bonsai_ffn_up = nullptr;
+    bf16* bonsai_ffn_h = nullptr;
+    // Resolved once at load rather than looked up per layer per token.
+    const signed char* bonsai_sign_h = nullptr;     // int8[hidden]
+    const signed char* bonsai_sign_ffn = nullptr;   // int8[moe_ffn]
 
     // DFlash speculative decoding (target-side primitives).
     DFlashDraftModel* dflash_draft = nullptr;
@@ -1429,7 +1732,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (capturing_graph)
         cu(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), sample ? "begin decode capture" : "begin prefill capture");
 
-    kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    if (s.bonsai_embed_native) {
+        // The table's rows are stored rotated -- that is what made quantising them to trits
+        // survivable -- so the row comes back in that basis and the inverse comes off here.
+        const auto it = s.bonsai_sign_dev.find(H);
+        kernels::launch_embedding_ptq1_unrotate(s.d_tok, s.w.embed_tokens,
+                                                static_cast<const signed char*>(it->second),
+                                                s.x, 1, H, (int)s.bonsai_block, st);
+    } else {
+        kernels::launch_embedding(s.d_tok, s.w.embed_tokens, s.x, 1, H, st);
+    }
     dbg_bf16(s.x, H, 0, -1);   // tag 0: post-embedding, pre emb_norm
     if (c.muse_glimmer && s.emb_norm_ones)
         kernels::launch_rmsnorm(s.x, s.emb_norm_ones, s.x, 1, H, c.rms_eps, st);
@@ -1545,6 +1857,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         if (pf_win & 1) pf_fork_n(w.wo, nullptr, pf_wo_bytes);
         dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
         dbg_xn_snapshot(s.xn, L);
+        if (s.bonsai_rot_xn) {
+            // Once, on the main stream, before the projections fan out across stream_k/stream_v.
+            const auto it = s.bonsai_sign_dev.find(H);
+            kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot_xn,
+                                                 static_cast<const signed char*>(it->second),
+                                                 H, (int)H, (int)s.bonsai_block, st);
+            // tag 15: the rotated xn. R is orthogonal, so this l2 must equal tag 10's exactly --
+            // a cheap in-model check that the rotation is what the isolated test says it is.
+            dbg_bf16(s.bonsai_rot_xn, H, 15, L);
+        }
         // xn_q8_ready assumes the PREVIOUS layer's tail already emitted Q8_1(this layer's xn)
         // into s.aq81 as a side effect (true for architectures whose post-MoE tail runs
         // launch_add_rmsnorm2_q8 / add_rmsnorm3_q8). Muse Glimmer's tail is the sandwich-norm
@@ -1597,6 +1919,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                                                1, N, H, pst)))
                         kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
                 }
+                else if (t == kPtq1GgmlType && s.bonsai_rot_xn)
+                    kernels::launch_gemv_ptq1(s.bonsai_rot_xn, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -2203,6 +2527,29 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // single fused kernel. That is the slow-but-obviously-correct shape for an accuracy
             // experiment; if the accuracy win is real, the fusion work follows, and NVFP4's
             // decoded magnitudes are exact int8 so a dp4a path is reachable.
+            // Ternary SwiGLU, read in the stored blocks. Same three-GEMV-plus-elementwise shape
+            // as the NVFP4 arm below and for the same reason: obviously correct first, and the
+            // fused kernel it replaces cannot drive type 143 at all.
+            //
+            // Two rotations, not one. Gate and up read the post-attention norm at the residual
+            // width; down reads SwiGLU's output at the FFN width, which is a different sign
+            // vector entirely. The second rotation is in place -- launch_hadamard_rotate_bf16
+            // permits aliasing, and each CTA owns its whole 1024-span.
+            if (w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
+                w.down_qtype == kPtq1GgmlType && s.bonsai_ffn_h && c.top_k == 1) {
+                kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
+                                                     H, (int)H, (int)s.bonsai_block, st);
+                kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
+                                          c.moe_ffn, H, st);
+                kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
+                                          c.moe_ffn, H, st);
+                kernels::launch_prefill_swiglu(s.bonsai_ffn_gate, s.bonsai_ffn_up,
+                                               s.bonsai_ffn_h, c.moe_ffn, st);
+                kernels::launch_hadamard_rotate_bf16(s.bonsai_ffn_h, s.bonsai_ffn_h,
+                                                     s.bonsai_sign_ffn, c.moe_ffn,
+                                                     (int)c.moe_ffn, (int)s.bonsai_block, st);
+                kernels::launch_gemv_ptq1(s.bonsai_ffn_h, w.down_q, s.routed, H, c.moe_ffn, st);
+            } else
             if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
                 // dp4a NVFP4 (SPARKINFER_QWEN38_NVFP4_DP4A=0 restores the float GEMVs). The
                 // weights stay exactly what the checkpoint ships -- NVFP4 magnitudes are integers,
@@ -2440,6 +2787,16 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
         kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    }
+    else if (s.gguf && s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot &&
+             s.bonsai_sign_dev.count(H) != 0) {
+        // Native ternary: the weights are still in the basis they were quantized in, so the
+        // activation goes there first rather than the rotation being folded into the weights.
+        const auto it = s.bonsai_sign_dev.find(H);
+        kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot,
+                                             static_cast<const signed char*>(it->second),
+                                             H, (int)H, (int)s.bonsai_block, st);
+        kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.w.lm_head, s.logits, c.vocab, H, st);
     }
     else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
     else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
@@ -3251,6 +3608,12 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           lin_state, lin_conv,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           s.dflash_capture ? s.dflash_layer_ids.data() : nullptr,
@@ -3359,6 +3722,12 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
                           lin_state[0], lin_conv[0],
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -3798,6 +4167,12 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, seq_ids[0],
                           h_states[0], h_convs[0], s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4173,6 +4548,12 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -4193,6 +4574,12 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.stream_k, s.stream_v, s.active_seq_id,
                           lin_state, lin_conv, s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.emb_norm_ones,
+                          s.bonsai_embed_native,
+                          s.bonsai_sign_dev.count(s.cfg.hidden)
+                              ? s.bonsai_sign_dev.at(s.cfg.hidden) : nullptr,
+                          s.bonsai_sign_ffn,
+                          (int)s.bonsai_block,
+                          s.bonsai_rot,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim,
                           s.moe_rs_gate, s.moe_rs_up, s.moe_rs_down, s.n_splits,
                           nullptr, 0, nullptr, 0 };
@@ -5489,6 +5876,106 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     Impl& s = *p_;
     GGUF g;
     if (!g.open(path)) return false;
+    // Ternary-Bonsai-2 declares a Hadamard rotation over its weights. Read it before any tensor is
+    // uploaded: a rotated weight loaded as though it were not is not degraded, it is noise.
+    PrismHadamard had;
+    {
+        std::string had_err;
+        if (!had.load(g, had_err)) {
+            fprintf(stderr, "[bonsai] prism.hadamard metadata is unusable: %s\n", had_err.c_str());
+            return false;
+        }
+    }
+    // Native PTQ1_0: keep the weights in their stored blocks and rotate the activation instead.
+    // Off by default -- the folded path is the one measured at PPL 8.07 -- because this trades a
+    // validated path for a much smaller one, and both arms should come out of the same binary.
+    // SPARKINFER_BONSAI_NATIVE selects which tensors stay in their stored blocks: "1"/"all", or a
+    // list of "head" and "embed". Selectable so a fault can be attributed to one of them rather
+    // than to "the native path".
+    static const std::string bonsai_native_set = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_NATIVE");
+        std::string v(e ? e : "");
+        // "qkv" and "gate" narrow "proj" to one tensor family, which is how the v-head
+        // regrouping bug in the native upload was attributed: attn_gate is entirely v heads and
+        // came out far more wrong than attn_qkv, where v is a third of the rows.
+        if (v == "1" || v == "all") v = "head,embed,proj,ffn";
+        return v;
+    }();
+    const bool bonsai_native = had.present && !bonsai_native_set.empty();
+    const bool bonsai_native_head = bonsai_native_set.find("head") != std::string::npos;
+    const bool bonsai_native_embed = bonsai_native_set.find("embed") != std::string::npos;
+    // "proj" takes every residual-width projection; "qkv" and "gate" take one family each, to
+    // attribute the projection fault to a tensor rather than to the slice.
+    const bool bonsai_proj_qkv_only = bonsai_native_set.find("qkv") != std::string::npos;
+    const bool bonsai_proj_gate_only = bonsai_native_set.find("gate") != std::string::npos;
+    const bool bonsai_native_proj = bonsai_native_set.find("proj") != std::string::npos ||
+                                    bonsai_proj_qkv_only || bonsai_proj_gate_only;
+    // "ffn" is separate from "proj" because it is the only family whose DOWN leg reads a
+    // non-residual width, and because it replaces a single fused Q4_K kernel with three GEMVs and
+    // an elementwise SwiGLU -- a different performance question from the projections.
+    const bool bonsai_native_ffn = bonsai_native_set.find("ffn") != std::string::npos;
+    if (bonsai_native) {
+        s.bonsai_block = had.block_size;
+        for (const auto& kv : had.signs_by_width) {
+            void* d = nullptr;
+            if (cudaMalloc(&d, kv.second.size()) != cudaSuccess) continue;
+            cudaMemcpy(d, kv.second.data(), kv.second.size(), cudaMemcpyHostToDevice);
+            s.bonsai_sign_dev[kv.first] = d;
+            s.owned.push_back(d);
+            s.bonsai_rot_elems = std::max(s.bonsai_rot_elems, kv.first);
+        }
+        if (s.bonsai_rot_elems > 0 &&
+            cudaMalloc((void**)&s.bonsai_rot, (size_t)s.bonsai_rot_elems * sizeof(bf16)) == cudaSuccess)
+            s.owned.push_back(s.bonsai_rot);
+        else
+            s.bonsai_rot = nullptr;
+        if (bonsai_native_proj && s.cfg.hidden > 0 &&
+            cudaMalloc((void**)&s.bonsai_rot_xn, (size_t)s.cfg.hidden * sizeof(bf16)) == cudaSuccess)
+            s.owned.push_back(s.bonsai_rot_xn);
+        else
+            s.bonsai_rot_xn = nullptr;
+        {
+            const auto sh = s.bonsai_sign_dev.find(s.cfg.hidden);
+            if (sh != s.bonsai_sign_dev.end())
+                s.bonsai_sign_h = static_cast<const signed char*>(sh->second);
+            const auto sf = s.bonsai_sign_dev.find(s.cfg.moe_ffn);
+            if (sf != s.bonsai_sign_dev.end())
+                s.bonsai_sign_ffn = static_cast<const signed char*>(sf->second);
+        }
+        // All four or none: a half-allocated FFN scratch would leave the decode branch reading a
+        // null buffer, and the folded path is a perfectly good fallback.
+        if (bonsai_native_ffn && s.cfg.hidden > 0 && s.cfg.moe_ffn > 0 &&
+            s.bonsai_sign_h && s.bonsai_sign_ffn) {
+            const size_t hb = (size_t)s.cfg.hidden * sizeof(bf16);
+            const size_t fb = (size_t)s.cfg.moe_ffn * sizeof(bf16);
+            if (cudaMalloc((void**)&s.bonsai_rot_hn, hb) == cudaSuccess &&
+                cudaMalloc((void**)&s.bonsai_ffn_gate, fb) == cudaSuccess &&
+                cudaMalloc((void**)&s.bonsai_ffn_up, fb) == cudaSuccess &&
+                cudaMalloc((void**)&s.bonsai_ffn_h, fb) == cudaSuccess) {
+                s.owned.push_back(s.bonsai_rot_hn);
+                s.owned.push_back(s.bonsai_ffn_gate);
+                s.owned.push_back(s.bonsai_ffn_up);
+                s.owned.push_back(s.bonsai_ffn_h);
+            } else {
+                cudaFree(s.bonsai_rot_hn); cudaFree(s.bonsai_ffn_gate);
+                cudaFree(s.bonsai_ffn_up); cudaFree(s.bonsai_ffn_h);
+                s.bonsai_rot_hn = s.bonsai_ffn_gate = s.bonsai_ffn_up = s.bonsai_ffn_h = nullptr;
+                fprintf(stderr, "[bonsai] FFN scratch alloc failed -- FFN stays folded\n");
+            }
+        }
+    }
+
+    // Shared by both upload paths: is this tensor one the checkpoint rotated, and which signs?
+    auto rotated_signs = [&](const GGUFTensor* t, const std::string& name)
+            -> const std::vector<int8_t>* {
+        if (!t || t->ggml_type != kPtq1GgmlType || !had.present) return nullptr;
+        if (!had.rotates(name) && had.inverse_rotated.count(name) == 0) return nullptr;
+        const std::vector<int8_t>* sign = had.signs_for(t->dims[0]);
+        if (!sign)
+            fprintf(stderr, "[bonsai] %s: no sign vector for input width %ld\n",
+                    name.c_str(), t->dims[0]);
+        return sign;
+    };
     const bool dense_file = g.tensor("blk.0.ffn_gate.weight") != nullptr &&
                             g.tensor("blk.0.ffn_gate_exps.weight") == nullptr;
     const bool hybrid_file = is_qwen35_or_qwen36_hybrid_moe(g) || dense_file;
@@ -5559,14 +6046,26 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dev_quant = [&](const std::string& name, int& qtype) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
-        if (!ggml_dequant_supported(t->ggml_type)) {
+        if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
+            UnrotateJob j;
+            if (!unrotate_job_init(j, t, name, *sign, had.block_size,
+                                   had.inverse_rotated.count(name) != 0)) return nullptr;
+            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
+            void* d = unrotate_ternary_to_q4k(j, name, s.stream);
+            if (!d) return nullptr;   // never fall back to the rotated bytes: they are not weights
+            qtype = 12;               // Q4_K
+            s.owned.push_back(d);
+            return d;
+        }
+        const HostBlocks hb = host_blocks_for_upload(t, name);
+        if (!ggml_dequant_supported(hb.ggml_type)) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
             return nullptr;
         }
-        qtype = t->ggml_type;
+        qtype = hb.ggml_type;
         void* d = nullptr;
-        if (cudaMalloc(&d, t->n_bytes) != cudaSuccess) return nullptr;
-        cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice);
+        if (cudaMalloc(&d, hb.bytes) != cudaSuccess) return nullptr;
+        cudaMemcpy(d, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         s.owned.push_back(d);
         return d;
     };
@@ -5656,14 +6155,42 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto dense = [&](const std::string& name, bool transpose) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { fprintf(stderr, "[gguf] missing %s\n", name.c_str()); return nullptr; }
-        if (!ggml_dequant_supported(t->ggml_type)) {
+        if (const std::vector<int8_t>* sign = rotated_signs(t, name)) {
+            // The embedding table: un-rotated straight to bf16, no requantization, because a
+            // lookup reads rows rather than multiplying by them.
+            UnrotateJob j;
+            if (!unrotate_job_init(j, t, name, *sign, had.block_size,
+                                   had.inverse_rotated.count(name) != 0)) return nullptr;
+            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
+            void* d = unrotate_ternary_to_bf16(j, name);
+            if (!d) return nullptr;
+            if (transpose) {
+                fprintf(stderr, "[bonsai] %s: transpose of an un-rotated tensor is not wired\n",
+                        name.c_str());
+                cudaFree(d);
+                return nullptr;
+            }
+            s.owned.push_back(d);
+            return d;
+        }
+        const HostBlocks hb = host_blocks_for_upload(t, name);
+        if (!ggml_dequant_supported(hb.ggml_type)) {
             fprintf(stderr, "[gguf] unsupported ggml type %d for %s\n", t->ggml_type, name.c_str());
             return nullptr;
         }
-        void* dq = nullptr; cudaMalloc(&dq, t->n_bytes);
-        cudaMemcpy(dq, t->data, t->n_bytes, cudaMemcpyHostToDevice);
+        void* dq = nullptr; cudaMalloc(&dq, hb.bytes);
+        cudaMemcpy(dq, hb.data, hb.bytes, cudaMemcpyHostToDevice);
         void* tmp = nullptr; cudaMalloc(&tmp, (size_t)t->n_values * 2);
-        kernels::launch_gguf_dequant(t->ggml_type, dq, tmp, t->n_values, s.stream);
+        if (!dq || !tmp) {
+            // Say so. Returning a silent nullptr here surfaces as whichever tensor the caller
+            // falls back to being reported "missing", which is a long way from the truth --
+            // especially since a sticky CUDA error from an earlier tensor lands right here.
+            fprintf(stderr, "[gguf] %s: device alloc failed (%s)\n",
+                    name.c_str(), cudaGetErrorString(cudaGetLastError()));
+            cudaFree(dq); cudaFree(tmp);
+            return nullptr;
+        }
+        kernels::launch_gguf_dequant(hb.ggml_type, dq, tmp, t->n_values, s.stream);
         const void* result;
         if (transpose) {
             const int in = (int)t->dims[0], out = (int)t->dims[1];   // ggml ne0=in, ne1=out
@@ -5846,15 +6373,75 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         q36_ud_requant_default && !q35_dense9b_requant_default);
     const bool req_lm_q4 = env_enabled("SPARKINFER_LMHEAD_REQUANT_Q4K",
                                        q35_dense9b_requant_default || dual_dflash_lm_head);
+    // A ternary tensor arrives as Q4_K once its rotation is folded in, so it belongs on the same
+    // MMVQ kernels every other quantized checkpoint uses. Letting it fall through to dense() would
+    // expand the attention weights to bf16 -- several GB, and a GEMV path this architecture's GDN
+    // projections otherwise never take.
     auto attn_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
+        // Only projections whose input is the residual width: those read the once-per-layer
+        // rotated xn in decode, and prefill's dq() carries the matching sign vector.
+        const bool proj_name_ok =
+            (!bonsai_proj_qkv_only && !bonsai_proj_gate_only) ||
+            (bonsai_proj_qkv_only && name.find(".attn_qkv.") != std::string::npos) ||
+            (bonsai_proj_gate_only && name.find(".attn_gate.") != std::string::npos);
+        if (bonsai_native_proj && proj_name_ok && t && t->ggml_type == kPtq1GgmlType &&
+            s.bonsai_rot_xn && t->dims[0] == s.cfg.hidden && s.bonsai_sign_dev.count(t->dims[0])) {
+            // The blocks go up as they are, but the GDN v-head order does NOT: everything that
+            // produces a v head stores its 48 heads transposed, and the folded path regroups them
+            // while un-rotating. Uploading verbatim skips that, which is why attn_gate (all v) was
+            // far more wrong than attn_qkv (v is one third of it). A row is a whole number of
+            // 28-byte blocks, so the regrouping is a byte-level permutation with no decoding.
+            UnrotateJob j;
+            if (!unrotate_job_init(j, t, name, *had.signs_for(t->dims[0]), had.block_size, false))
+                return nullptr;
+            if (had.gdn_v_grouped) unrotate_job_set_v_block(j, name, s.cfg);
+            const size_t row_bytes = (size_t)(j.width / kPtq1BlockElems) * kPtq1BlockBytes;
+            std::vector<uint8_t> host((size_t)t->n_bytes);
+            const auto* src = static_cast<const uint8_t*>(t->data);
+            for (long r = 0; r < j.rows; ++r)
+                std::memcpy(host.data() + (size_t)r * row_bytes,
+                            src + (size_t)unrotate_source_row(j, r) * row_bytes, row_bytes);
+            void* d = nullptr;
+            if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+                cudaMemcpy(d, host.data(), t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                s.owned.push_back(d);
+                type = kPtq1GgmlType;
+                return d;
+            }
+            cudaFree(d);
+            fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
+        }
+        if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
     };
+    // The dense FFN's three matrices, left in their stored blocks. No v-head regrouping applies:
+    // that is a property of tensors PRODUCING a GDN v head, and none of these does. Gate and up
+    // read the residual width, down reads the FFN width -- both sign vectors are required up
+    // front, because a down leg that fell back to Q4_K while gate/up went native would be reading
+    // a correctly-rotated activation with un-rotated weights.
+    auto ffn_w = [&](const std::string& name, int& type) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        if (bonsai_native_ffn && s.bonsai_ffn_h && t && t->ggml_type == kPtq1GgmlType &&
+            s.bonsai_sign_dev.count(t->dims[0])) {
+            void* d = nullptr;
+            if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                s.owned.push_back(d);
+                type = kPtq1GgmlType;
+                return d;
+            }
+            cudaFree(d);
+            fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
+        }
+        return nullptr;   // caller falls through to its existing quantized path
+    };
     auto attn_w_opt = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         if (!t) { type = 0; return nullptr; }
+        if (qattn && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8))
             return dev_quant_requant_q4k(name, type, req_attn_q4(name, t->ggml_type));
         type = 0; return dense(name, false);
@@ -5871,12 +6458,57 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     auto lm_w = [&](const std::string& name, int& type) -> const void* {
         const GGUFTensor* t = g.tensor(name);
         const bool q5k_ok = mg_lm_q5k && s.cfg.muse_glimmer && t && t->ggml_type == 13;
+        if (bonsai_native_head && t && t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
+            s.bonsai_sign_dev.count(t->dims[0])) {
+            // Straight upload: no un-rotation, no refit, 0.21875 bytes/weight.
+            void* d = nullptr;
+            if (cudaMalloc(&d, t->n_bytes) == cudaSuccess &&
+                cudaMemcpy(d, t->data, t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                s.owned.push_back(d);
+                type = kPtq1GgmlType;
+                return d;
+            }
+            cudaFree(d);
+            fprintf(stderr, "[bonsai] %s: native upload failed, falling back\n", name.c_str());
+        }
+        if (qattn && t && t->ggml_type == kPtq1GgmlType) return dev_quant(name, type);
         if (qattn && t && (t->ggml_type == 12 || t->ggml_type == 14 || t->ggml_type == 8 || q5k_ok))
             return dev_quant_requant_q4k(name, type, req_lm_q4 || q5k_ok, q5k_ok);
         type = 0; return dense(name, false);
     };
     auto dense_opt = [&](const std::string& name, bool transpose) -> const void* {
         return g.tensor(name) ? dense(name, transpose) : nullptr;
+    };
+    // Returns null unless this checkpoint declares the transposed GDN v order, so every other
+    // model keeps its existing loader untouched.
+    // Everything that PRODUCES a GDN v head is stored transposed, so all of it is regrouped: the
+    // per-head scalars, the alpha/beta projections and conv1d's v channels. The runtime has to see
+    // the architecture's own order because the q/k-to-v grouping is baked into the GDN kernel --
+    // v head r is driven by q/k head r/3 -- so leaving the file's order in place is not an option.
+    // SPARKINFER_BONSAI_VREGROUP narrows the set, which is how the missing conv1d was found.
+    static const std::string vregroup_set = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_VREGROUP");
+        return std::string(e && e[0] ? e : "a,dt,alpha,beta,conv");
+    }();
+    auto v_regroup = [&](const std::string& name) -> const void* {
+        const GGUFTensor* t = g.tensor(name);
+        if (!t || !had.present || !had.gdn_v_grouped) return nullptr;
+        const char* key = name.find("ssm_a") != std::string::npos && name.find("alpha") == std::string::npos
+                              ? "a"
+                        : name.find("ssm_dt") != std::string::npos ? "dt"
+                        : name.find("alpha") != std::string::npos ? "alpha"
+                        : name.find("beta") != std::string::npos ? "beta"
+                        : name.find("ssm_conv1d") != std::string::npos ? "conv" : "";
+        if (!key[0] || vregroup_set.find(key) == std::string::npos) return nullptr;
+        // conv1d carries q, k and then v across its channel axis; only the v channels move, and
+        // they move in blocks of the GDN head dimension rather than one row per head.
+        const bool is_conv = name.find("ssm_conv1d") != std::string::npos;
+        const long row0 = is_conv ? 2 * (long)s.cfg.linear_q_heads * s.cfg.linear_head_dim : 0;
+        const long rows_per_head = is_conv ? s.cfg.linear_head_dim : 1;
+        void* d = upload_v_regrouped_bf16(t, name, row0, s.cfg.linear_v_heads,
+                                          s.cfg.linear_q_heads, rows_per_head);
+        if (d) s.owned.push_back(d);
+        return d;
     };
     auto expect_dims = [&](const std::string& name, std::initializer_list<long> dims) -> bool {
         const GGUFTensor* t = g.tensor(name);
@@ -5901,7 +6533,21 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         return !g.tensor(name) || expect_dims(name, dims);
     };
 
-    s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
+    if (const GGUFTensor* emb_t = g.tensor("token_embd.weight");
+        bonsai_native_embed && emb_t && emb_t->ggml_type == kPtq1GgmlType && s.bonsai_rot &&
+        s.bonsai_sign_dev.count(emb_t->dims[0])) {
+        void* d = nullptr;
+        if (cudaMalloc(&d, emb_t->n_bytes) == cudaSuccess &&
+            cudaMemcpy(d, emb_t->data, emb_t->n_bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            s.owned.push_back(d);
+            s.w.embed_tokens = d;
+            s.bonsai_embed_native = true;              // 0.28 GB of table instead of 2.54 in bf16
+        } else {
+            cudaFree(d);
+        }
+    }
+    if (!s.bonsai_embed_native)
+        s.w.embed_tokens = dense("token_embd.weight", false);     // [vocab,hidden] as-is
     s.w.final_norm   = dense("output_norm.weight", false);
     const char* lm = g.tensor("output.weight") ? "output.weight" : "token_embd.weight";  // tied fallback
     const GGUFTensor* lm_tensor = g.tensor(lm);
@@ -5935,11 +6581,22 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 !expect_dims(b + "ssm_out.weight", {s.linear_vdim, H})) return false;
             w.wqkv = attn_w(b + "attn_qkv.weight", w.wqkv_type);
             w.wqkv_gate = attn_w(b + "attn_gate.weight", w.wqkv_gate_type);
-            w.ssm_conv = dense(b + "ssm_conv1d.weight", false);
-            w.ssm_dt = dense(b + "ssm_dt.bias", false);
-            w.ssm_a = dense(b + "ssm_a", false);
-            w.ssm_beta = attn_w(b + "ssm_beta.weight", w.ssm_beta_type);
-            w.ssm_alpha = attn_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
+            w.ssm_conv = v_regroup(b + "ssm_conv1d.weight");
+            if (!w.ssm_conv) w.ssm_conv = dense(b + "ssm_conv1d.weight", false);
+            w.ssm_dt = v_regroup(b + "ssm_dt.bias");
+            if (!w.ssm_dt) w.ssm_dt = dense(b + "ssm_dt.bias", false);
+            w.ssm_a = v_regroup(b + "ssm_a");
+            if (!w.ssm_a) w.ssm_a = dense(b + "ssm_a", false);
+            if (const void* bp = v_regroup(b + "ssm_beta.weight")) {
+                w.ssm_beta = bp; w.ssm_beta_type = 0;
+            } else {
+                w.ssm_beta = attn_w(b + "ssm_beta.weight", w.ssm_beta_type);
+            }
+            if (const void* ap = v_regroup(b + "ssm_alpha.weight")) {
+                w.ssm_alpha = ap; w.ssm_alpha_type = 0;
+            } else {
+                w.ssm_alpha = attn_w(b + "ssm_alpha.weight", w.ssm_alpha_type);
+            }
             w.ssm_norm = dense(b + "ssm_norm.weight", false);
             w.ssm_out = attn_w(b + "ssm_out.weight", w.ssm_out_type);
         } else {
@@ -6038,11 +6695,18 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             // consumes equal-stride pairs; unselected layers retain the native Q4_K path.
             const bool gu3 = ffn_q3a_on("ffn_gate") && ffn_q3a_on("ffn_up") &&
                              int_list_has(ffn_q3a_layers, i);
-            w.gate_q = gu3 ? dev_quant_q3a(b + "ffn_gate.weight", w.gate_qtype, &w.prefill_gate_q, &w.prefill_gate_qtype)
-                           : dev_quant(b + "ffn_gate.weight", w.gate_qtype);
-            w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype, &w.prefill_up_q, &w.prefill_up_qtype)
-                           : dev_quant(b + "ffn_up.weight", w.up_qtype);
-            w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
+            // Native ternary first, and all three together: the decode branch below needs the
+            // whole SwiGLU in one basis, so a partial take is worse than none.
+            w.gate_q = ffn_w(b + "ffn_gate.weight", w.gate_qtype);
+            w.up_q   = w.gate_q ? ffn_w(b + "ffn_up.weight", w.up_qtype) : nullptr;
+            w.down_q = w.up_q   ? ffn_w(b + "ffn_down.weight", w.down_qtype) : nullptr;
+            if (!(w.gate_q && w.up_q && w.down_q)) {
+                w.gate_q = gu3 ? dev_quant_q3a(b + "ffn_gate.weight", w.gate_qtype, &w.prefill_gate_q, &w.prefill_gate_qtype)
+                               : dev_quant(b + "ffn_gate.weight", w.gate_qtype);
+                w.up_q   = gu3 ? dev_quant_q3a(b + "ffn_up.weight", w.up_qtype, &w.prefill_up_q, &w.prefill_up_qtype)
+                               : dev_quant(b + "ffn_up.weight", w.up_qtype);
+                w.down_q = dev_quant_down(b + "ffn_down.weight", w.down_qtype);
+            }
         } else {
             if (!expect_dims(b + "ffn_gate_inp.weight", {H, c.n_experts})) return false;
             // Router weight: keep Q8_0 raw if present in the GGUF (half bandwidth, on-read GEMV)

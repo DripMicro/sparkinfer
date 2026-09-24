@@ -12,6 +12,9 @@
 // shares no code with the decode path (qwen35.cpp keeps Impl private).
 
 #include "qwen35_prefill.h"
+#include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/ternary_ptq1.h"
+#include "sparkinfer/kernels/hadamard.h"
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
@@ -1640,6 +1643,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // Dequantize a native GGUF weight [n_out,K] to bf16 scratch; return a bf16 [n_out,K] ptr.
     auto dq = [&](const void* W, int wtype, int n_out, int K) -> const void* {
         if (wtype == 0) return W;   // already bf16 dense
+        if (wtype == kPtq1GgmlType) {
+            // Ternary, stored rotated. Every branch below wants ordinary bf16, so decode and take
+            // the rotation off here; the resident weight stays in its 28-byte blocks. Matched on
+            // K rather than assumed: a sign vector belongs to ONE input width, and applying the
+            // residual width's to the 6144-wide attention output or the FFN's down leg would be
+            // reading the weights in the wrong basis rather than approximately right.
+            const void* sign = (K == c.hidden)                          ? s.bonsai_sign_hidden
+                             : (c.moe_ffn > 0 && K == c.moe_ffn)        ? s.bonsai_sign_ffn
+                                                                        : nullptr;
+            if (sign) {
+                kernels::launch_ptq1_rows_unrotate_bf16(
+                    W, static_cast<const signed char*>(sign), wbuf, n_out, K, s.bonsai_block, st);
+                return wbuf;
+            }
+        }
         if (wtype == kernels::SI_QTYPE_FP8) {
             kernels::launch_ct_dequant_fp8_packed(W, wbuf, n_out, K, st);
             return wbuf;
@@ -1908,7 +1926,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
 
     // embed -> x, prime xn = RMSNorm(x, layer0.input_norm)
+    if (s.bonsai_embed_native) {
+        // Ternary table: decode the row, then take off the rotation it was stored in.
+        kernels::launch_embedding_ptq1_unrotate(
+            d_ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
+            x, N, H, s.bonsai_block, st);
+    } else {
     kernels::launch_embedding(d_ids, s.w.embed_tokens, x, N, H, st);
+    }
     // Image input, if any: overwrite the rows whose token is image_token_id with the vision
     // tower's merged embeddings. Strictly additive -- s.vision_emb is null for every text-only
     // request, so this branch is not taken and no vision code is referenced at all. The caller
@@ -3328,6 +3353,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (s.w.lm_head_type == 12 && lm_q8 && lm_ad && lm_as) {
             kernels::launch_quantize_q8_1(xn_last, lm_q8, lm_ad, lm_as, H, st);
             kernels::launch_gemv_q_dp4a_pq_f32(lm_q8, lm_ad, lm_as, s.w.lm_head, s.logits, c.vocab, H, st);
+        } else if (s.w.lm_head_type == kPtq1GgmlType && s.bonsai_rot && s.bonsai_sign_hidden) {
+            // Ternary head: prefill's seed argmax reads it too, and launch_gemv_q_f32 does not
+            // know this type -- it would read blocks of the wrong size rather than refuse.
+            kernels::launch_hadamard_rotate_bf16(
+                xn_last, s.bonsai_rot, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                H, H, s.bonsai_block, st);
+            kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.w.lm_head, s.logits, c.vocab, H, st);
         } else if (s.w.lm_head_type)
             kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
         else
@@ -3827,6 +3859,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     bf16* qg = lnrm;
     bf16* kf = gq;
     bf16* vf = gk;
+    // Rotated activations for the ternary path. One buffer at the widest input this pass can
+    // project (the FFN width); the residual-width uses are a prefix of it. Only a checkpoint that
+    // carries sign vectors pays for it.
+    const bool bonsai_any = s.bonsai_sign_hidden || s.bonsai_sign_ffn;
+    bf16* bonsai_rot_n = bonsai_any
+        ? a.alloc<bf16>((size_t)NA * (size_t)(ffn > H ? ffn : H)) : nullptr;
+    // What bonsai_rot_n currently holds. Same convention as the dp4a/fp8 activation staging
+    // below: the rotation is issued ONCE on the main stream before the fork, and the side
+    // streams only ever read it. A side stream that rotated for itself would be writing shared
+    // scratch that the main stream is reading.
+    const bf16* bonsai_rot_src = nullptr;
+    int bonsai_rot_k = 0;
     bf16* sg = a.alloc<bf16>((size_t)NA * ffn);
     bf16* su = a.alloc<bf16>((size_t)NA * ffn);
     bf16* sh = a.alloc<bf16>((size_t)NA * ffn);
@@ -4145,6 +4189,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 kernels::launch_gemv_nvfp4(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
             return true;
         }
+        // Ternary, read in its stored blocks. The activation carries the rotation, so it is
+        // rotated for all N rows in one call and the batched GEMM reads each weight once for the
+        // whole batch -- which is the point of packing a decode step at all, and is bit-identical
+        // per row to the single-row GEMV that AR decode drives (gemv_ptq1_gpu_test).
+        if (type == kPtq1GgmlType) {
+            const void* sgn = (k == H)                           ? s.bonsai_sign_hidden
+                            : (c.moe_ffn > 0 && k == c.moe_ffn)  ? s.bonsai_sign_ffn
+                                                                 : nullptr;
+            if (!sgn || !bonsai_rot_n) {
+                verify_decline("[dflash-verify] ternary projection has no sign vector for K=%d\n", k);
+                return false;
+            }
+            // Already staged for this activation (the layer body does it ahead of the fork): reuse
+            // it, both to skip the work and because re-rotating would overwrite what the side
+            // stream is reading.
+            if (bonsai_rot_src == in && bonsai_rot_k == k) {
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w, out, no, k, N, st);
+                return true;
+            }
+            kernels::launch_hadamard_rotate_bf16(in, bonsai_rot_n,
+                                                 static_cast<const signed char*>(sgn),
+                                                 (long)N * k, k, s.bonsai_block, st);
+            bonsai_rot_src = in;
+            bonsai_rot_k = k;
+            kernels::launch_gemm_ptq1(bonsai_rot_n, w, out, no, k, N, st);
+            return true;
+        }
         if (type != 8 && type != 12 && type != 14) {
             verify_decline("[dflash-verify] unsupported projection type=%d N=%d K=%d\n", type, no, k);
             return false;
@@ -4221,6 +4292,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     auto proj_on = [&](cudaStream_t ps, const bf16* in, const void* w, int type, bf16* out,
                        int no, int k) -> bool {
         if (type == 0) return kernels::launch_gemv_rows(in, w, out, N, no, k, ps);
+        // Ternary reads the rotation the main stream staged for this exact activation; it never
+        // rotates here, for the reason the note below gives about shared scratch off-stream. An
+        // unstaged input declines rather than racing -- the layer body stages xn ahead of the
+        // fork, so the projections that reach this actually find it.
+        if (type == kPtq1GgmlType) {
+            if (bonsai_rot_n && bonsai_rot_src == in && bonsai_rot_k == k) {
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w, out, no, k, N, ps);
+                return true;
+            }
+            verify_decline("[dflash-verify] ternary side-stream projection was not staged K=%d\n", k);
+            return false;
+        }
         if (type == kernels::SI_QTYPE_FP8 && fp8_gemm_on(ps, in, w, out, no, k)) return true;
         // Native FP8/NVFP4 touch no shared q81 scratch, so unlike the mmvq path below they are
         // safe on ANY stream and never need the fall-back to `st`.
@@ -4398,7 +4481,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         else
             dflash_kernels::launch_broadcast_rows_i32(btable_win, btab_rows_win, mbs, N, st);
     }
+    if (s.bonsai_embed_native) {
+        // Ternary table: decode the row, then take off the rotation it was stored in.
+        kernels::launch_embedding_ptq1_unrotate(
+            ids, s.w.embed_tokens, static_cast<const signed char*>(s.bonsai_sign_hidden),
+            x, N, H, s.bonsai_block, st);
+    } else {
     kernels::launch_embedding(ids, s.w.embed_tokens, x, N, H, st);
+    }
     if (muse) {
         // Unweighted RMSNorm of the embedding before layer 0 (emb_norm_ones is a constant-1.0
         // "weight"), exactly as AR decode and the batched prefill do.
@@ -4762,6 +4852,19 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                  w.ssm_beta_type == kernels::SI_QTYPE_NVFP4)) quant_nv_rows(xn, H);
             if (fp8_gemm && (w.wqkv_type == kernels::SI_QTYPE_FP8 ||
                              w.wqkv_gate_type == kernels::SI_QTYPE_FP8)) fp8_stage(xn, H, true);
+            // Same rule for the ternary basis: wqkv_gate and the alpha/beta projections run on
+            // the side stream, and all four read xn rotated at the residual width. Rotate it here,
+            // once, ahead of the fork -- a side stream doing its own would race the main stream's
+            // reader for the one scratch buffer.
+            if (bonsai_rot_n && s.bonsai_sign_hidden &&
+                (w.wqkv_type == kPtq1GgmlType || w.wqkv_gate_type == kPtq1GgmlType ||
+                 w.ssm_alpha_type == kPtq1GgmlType || w.ssm_beta_type == kPtq1GgmlType)) {
+                kernels::launch_hadamard_rotate_bf16(
+                    xn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                    (long)N * H, H, s.bonsai_block, st);
+                bonsai_rot_src = xn;
+                bonsai_rot_k = H;
+            }
             // One quantize of xn feeds both in-projections, exactly as gate/up share theirs.
             const bool gdn_in_gemm = packed && fp4_a && fp4_asf && N >= kProjGemmMinRows &&
                                      w.gdn_qkv_fp4 && w.gdn_qkv_fp4_sf &&
@@ -5069,8 +5172,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 return !(e && e[0] == '0');
             }();
             const bool native_ffn = kDecodeNvfp4 && w.gate_nv && w.up_nv && w.down_nv;
-            const bool q4_ffn = w.gate_q && w.up_q && w.down_q;
-            if (!native_ffn && !q4_ffn) {
+            // Ternary is checked on the TYPE, not on the pointer: the blocks live in gate_q/up_q/
+            // down_q like any quantized weight, so `q4_ffn` is true for them and they would
+            // otherwise be handed to the Q4_K expert kernel, which cannot read type 143.
+            const bool ternary_ffn = w.gate_qtype == kPtq1GgmlType &&
+                                     w.up_qtype == kPtq1GgmlType &&
+                                     w.down_qtype == kPtq1GgmlType;
+            const bool q4_ffn = !ternary_ffn && w.gate_q && w.up_q && w.down_q;
+            if (!native_ffn && !q4_ffn && !ternary_ffn) {
                 verify_decline("[dflash-verify] dense layer=%d missing gate/up/down\n", L);
                 supported = false; break;
             }
@@ -5180,6 +5289,30 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                             N, H, ffn);
                     supported = false; break;
                 }
+            } else if (ternary_ffn) {
+                // Same shape as the AR decode arm in qwen35.cpp, at N rows: rotate the
+                // post-attention norm at the residual width, gate and up, SwiGLU, then rotate
+                // that output at the FFN width for down. Two rotations, two sign vectors.
+                if (topk != 1 || !bonsai_rot_n || !s.bonsai_sign_hidden || !s.bonsai_sign_ffn) {
+                    verify_decline("[dflash-verify] ternary FFN without both sign vectors N=%d\n", N);
+                    supported = false; break;
+                }
+                // The FFN reuses the one rotation buffer, so whatever the layer body staged in
+                // it is gone from here on. `xn` is the SAME pointer every layer, so leaving the
+                // staging marked valid would let the next layer's projections read the FFN's
+                // rotated SwiGLU output and call it a rotated xn.
+                bonsai_rot_src = nullptr;
+                bonsai_rot_k = 0;
+                kernels::launch_hadamard_rotate_bf16(
+                    hn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                    (long)N * H, H, s.bonsai_block, st);
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w.gate_q, sg, ffn, H, N, st);
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w.up_q, su, ffn, H, N, st);
+                kernels::launch_prefill_swiglu(sg, su, sh, (long)N * ffn, st);
+                kernels::launch_hadamard_rotate_bf16(
+                    sh, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_ffn),
+                    (long)N * ffn, ffn, s.bonsai_block, st);
+                kernels::launch_gemm_ptq1(bonsai_rot_n, w.down_q, routed, H, ffn, N, st);
             } else if (native_ffn) {
                 if (topk != 1 ||
                     !kernels::launch_gemv_nvfp4_rows(hn, w.gate_nv, sg, N, ffn, H, st) ||
@@ -5421,6 +5554,26 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                                                          s.w.lm_head_fp4_sf, logits,
                                                          N, c.vocab, H, fp4_ws, st,
                                                          s.w.lm_head_fp4_alpha);
+    }
+    // Ternary head, read in its stored blocks. First in the chain because every arm below
+    // consumes the Q8_1 activation against a Q4_K-shaped head, and this one wants the rotated
+    // bf16 activation instead -- there is no shared preparation to fall through. One batched GEMM
+    // reads the head once for the whole batch; it is the largest weight in the model, so that is
+    // most of what packing buys at the output end, and it is bit-identical per row to the
+    // single-row GEMV AR decode drives.
+    if (!head_ok && s.w.lm_head_type == kPtq1GgmlType) {
+        if (!bonsai_rot_n || !s.bonsai_sign_hidden) {
+            verify_decline("[dflash-verify] ternary head has no sign vector for H=%d\n", H);
+            abandon_capture();
+            return -1;
+        }
+        bonsai_rot_src = nullptr;
+        bonsai_rot_k = 0;
+        kernels::launch_hadamard_rotate_bf16(
+            xn, bonsai_rot_n, static_cast<const signed char*>(s.bonsai_sign_hidden),
+            (long)N * H, H, s.bonsai_block, st);
+        kernels::launch_gemm_ptq1_f32(bonsai_rot_n, s.w.lm_head, logits, c.vocab, H, N, st);
+        head_ok = true;
     }
     if (head_ok) {
         // served by the block-scaled GEMM above

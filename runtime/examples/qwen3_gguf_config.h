@@ -150,6 +150,13 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         cfg.linear_q_heads = (int)qwen3_meta_int(g, "ssm.group_count", cfg.n_q_heads);
         cfg.linear_head_dim = (int)qwen3_meta_int(g, "ssm.state_size", cfg.linear_head_dim);
         cfg.linear_conv_kernel = (int)qwen3_meta_int(g, "ssm.conv_kernel", cfg.linear_conv_kernel);
+        // GDN v-head -> q/k-head convention. The default (cyclic) is what Qwythos/Qwen3.6-35B-A3B
+        // validated at v/q ratio 2. A checkpoint carrying prism.hadamard.gdn_v_grouped stores its
+        // v heads transposed and the loader regroups them into the architecture's own order, which
+        // is the block convention -- the same one qwen38_hf_config.h sets for this family from the
+        // safetensors side. Leaving it cyclic after regrouping pairs every v head with the wrong
+        // q/k head, which costs accuracy without breaking anything loudly.
+        if (g.meta_int("prism.hadamard.gdn_v_grouped", 0) != 0) cfg.gdn_qh_block = true;
         // linear_v_heads is derived from blk.0.attn_qkv.weight's real shape below, not read
         // from metadata directly -- no single GGUF key reliably holds it across exports (this
         // model's own v-head count lives under ssm.time_step_rank, a key the derivation below
@@ -167,7 +174,18 @@ static void qwen3_config_from_gguf(const sparkinfer::GGUF& g, sparkinfer::Qwen35
         // used as the detection signal for "this is the MTP-capable Qwen3.8-27B family" rather
         // than a raw architecture/name string match, since it's the same signal already read
         // above and is specific to this family (Qwythos has no MTP head).
-        if (qwen3_meta_int(g, "nextn_predict_layers", 0) > 0) {
+        // The Qwen3.8-27B family, by shape rather than by its MTP head. nextn_predict_layers was
+        // the original signal, but it only marks the checkpoints that ship an MTP block: a
+        // derivative without one -- Ternary-Bonsai-2, which quantizes the same 64-layer backbone --
+        // answered to the default model name of an unrelated 35B MoE and, worse, missed the
+        // chat-template behaviour and the second stop token that this family needs. The GGUF
+        // carries only tokenizer.ggml.eos_token_id (248046); the model's own generation_config
+        // lists 248044 beside it, and GGUF metadata has nowhere to put the second.
+        const bool qwen38_shape =
+            cfg.n_layers == 64 && cfg.hidden == 5120 && cfg.n_q_heads == 24 &&
+            cfg.n_kv_heads == 4 && cfg.head_dim == 256 && cfg.moe_ffn == 17408 &&
+            cfg.vocab == 248320;
+        if (qwen38_shape || qwen3_meta_int(g, "nextn_predict_layers", 0) > 0) {
             cfg.eos_id2 = 248044;
             cfg.qwen38 = true;
         }

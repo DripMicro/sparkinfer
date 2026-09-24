@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sparkinfer {
@@ -30,7 +31,16 @@ public:
     // Numeric metadata array (e.g. muse-glimmer.attention.sliding_window_pattern).
     // Empty vector if the key is absent or was a string array.
     std::vector<long> meta_int_array(const std::string& key) const;
+    // String metadata array, captured only for arrays of at most 4096 entries (the tokenizer
+    // vocab is skipped); empty if the key is absent, longer than that, or not a string array.
+    std::vector<std::string> meta_str_array(const std::string& key) const;
     const GGUFTensor* tensor(const std::string& name) const;
+    // Every metadata entry, key and a printable value, for inspecting an unfamiliar checkpoint.
+    // Sorted by key. String arrays too long to have been captured show as their element count.
+    std::vector<std::pair<std::string, std::string>> meta_all() const;
+    // Every tensor in the file, for inventory and for loaders that must reason about the whole
+    // set (which types appear, which rows need rotating) rather than ask for one name at a time.
+    const std::unordered_map<std::string, GGUFTensor>& tensors() const { return tensors_; }
 
 private:
 #ifndef _WIN32
@@ -45,6 +55,7 @@ private:
     std::unordered_map<std::string, double>      floats_;
     std::unordered_map<std::string, std::string> strs_;
     std::unordered_map<std::string, std::vector<long>> int_arrays_;
+    std::unordered_map<std::string, std::vector<std::string>> str_arrays_;
     std::unordered_map<std::string, GGUFTensor>  tensors_;
 };
 

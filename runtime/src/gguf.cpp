@@ -4,6 +4,7 @@
 #include "sparkinfer/gguf.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -48,6 +49,13 @@ void block_info(int t, long& bytes, long& elems) {
         case 12: bytes=144; elems=256; break;   // Q4_K
         case 13: bytes=176; elems=256; break;   // Q5_K
         case 14: bytes=210; elems=256; break;   // Q6_K
+        // PTQ1_0: ternary {-1,0,+1} with one FP16 scale per 128 weights, 1.75 bits each
+        // (prism-ml Ternary-Bonsai-2; see ternary_ptq1.h for the byte layout).
+        case 30: bytes=2;   elems=1;   break;   // BF16
+        case 143: bytes=28; elems=128; break;   // PTQ1_0
+        // Unknown type: zero bytes per block, so the tensor sizes to nothing. Callers must treat
+        // a zero-byte tensor as unusable rather than as an empty one -- a zero-sized allocation
+        // looks like an out-of-memory failure several tensors later.
         default: bytes=0;   elems=1;   break;
     }
 }
@@ -171,7 +179,19 @@ bool GGUF::open(const std::string& path) {
         else if (vt == VT_I64) { ints_[key] = c.rd<int64_t>(); }
         else if (vt == VT_ARR) {
             uint32_t et = c.rd<uint32_t>(); uint64_t n = c.rd<uint64_t>();
-            if (et == VT_STR) { for (uint64_t k = 0; k < n && c.ok; k++) c.rd_str(); }
+            if (et == VT_STR) {
+                // Short string arrays are kept (prism.hadamard.weight_names lists the 401 rotated
+                // tensors); the tokenizer vocab -- a quarter of a million strings -- is still
+                // skipped, which is why this is bounded rather than unconditional.
+                const bool keep = n <= 4096;
+                std::vector<std::string> arr;
+                if (keep) arr.reserve((size_t)n);
+                for (uint64_t k = 0; k < n && c.ok; k++) {
+                    std::string s = c.rd_str();
+                    if (keep) arr.push_back(std::move(s));
+                }
+                if (keep && c.ok) str_arrays_[key] = std::move(arr);
+            }
             else {
                 // Fail loudly on an unsupported element type (scalar_size==0 -> a 0-byte
                 // skip would desync the cursor) or a declared span that overflows / runs
@@ -262,10 +282,46 @@ bool GGUF::open(const std::string& path) {
 long GGUF::meta_int(const std::string& k, long d) const { auto it=ints_.find(k); return it==ints_.end()?d:it->second; }
 double GGUF::meta_float(const std::string& k, double d) const { auto it=floats_.find(k); return it==floats_.end()?d:it->second; }
 std::string GGUF::meta_str(const std::string& k, const std::string& d) const { auto it=strs_.find(k); return it==strs_.end()?d:it->second; }
+std::vector<std::string> GGUF::meta_str_array(const std::string& key) const {
+    auto it = str_arrays_.find(key);
+    return it == str_arrays_.end() ? std::vector<std::string>{} : it->second;
+}
+
 std::vector<long> GGUF::meta_int_array(const std::string& k) const {
     auto it = int_arrays_.find(k);
     return it == int_arrays_.end() ? std::vector<long>{} : it->second;
 }
 const GGUFTensor* GGUF::tensor(const std::string& n) const { auto it=tensors_.find(n); return it==tensors_.end()?nullptr:&it->second; }
+
+
+std::vector<std::pair<std::string, std::string>> GGUF::meta_all() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    char buf[64];
+    for (const auto& kv : ints_) {
+        std::snprintf(buf, sizeof(buf), "%ld", kv.second);
+        out.emplace_back(kv.first, buf);
+    }
+    for (const auto& kv : floats_) {
+        std::snprintf(buf, sizeof(buf), "%g", kv.second);
+        out.emplace_back(kv.first, buf);
+    }
+    for (const auto& kv : strs_) out.emplace_back(kv.first, kv.second);
+    for (const auto& kv : int_arrays_) {
+        std::string v = "[";
+        for (size_t i = 0; i < kv.second.size() && i < 12; ++i) {
+            std::snprintf(buf, sizeof(buf), "%s%ld", i ? ", " : "", kv.second[i]);
+            v += buf;
+        }
+        if (kv.second.size() > 12) v += ", ...";
+        std::snprintf(buf, sizeof(buf), "] (%zu)", kv.second.size());
+        out.emplace_back(kv.first, v + buf);
+    }
+    for (const auto& kv : str_arrays_) {
+        std::snprintf(buf, sizeof(buf), "<%zu strings>", kv.second.size());
+        out.emplace_back(kv.first, buf);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 } // namespace sparkinfer

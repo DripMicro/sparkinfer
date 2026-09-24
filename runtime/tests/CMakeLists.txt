@@ -121,3 +121,32 @@ add_executable(qwen_vision_video_cpu_test qwen_vision_video_cpu_test.cpp
 target_include_directories(qwen_vision_video_cpu_test PRIVATE ../include)
 set_target_properties(qwen_vision_video_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen_vision_video_cpu_test COMMAND qwen_vision_video_cpu_test)
+
+add_executable(ternary_ptq1_cpu_test ternary_ptq1_cpu_test.cpp ../src/ternary_ptq1.cpp)
+set_target_properties(ternary_ptq1_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(ternary_ptq1_cpu_test PRIVATE ../include)
+add_test(NAME ternary_ptq1_cpu_test COMMAND ternary_ptq1_cpu_test)
+
+add_executable(prism_hadamard_cpu_test prism_hadamard_cpu_test.cpp ../src/prism_hadamard.cpp ../src/gguf.cpp)
+set_target_properties(prism_hadamard_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(prism_hadamard_cpu_test PRIVATE ../include)
+add_test(NAME prism_hadamard_cpu_test COMMAND prism_hadamard_cpu_test)
+
+add_executable(gdn_v_regroup_cpu_test gdn_v_regroup_cpu_test.cpp)
+set_target_properties(gdn_v_regroup_cpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(gdn_v_regroup_cpu_test PRIVATE ../include)
+add_test(NAME gdn_v_regroup_cpu_test COMMAND gdn_v_regroup_cpu_test)
+
+add_executable(hadamard_rotate_gpu_test hadamard_rotate_gpu_test.cpp ../src/prism_hadamard.cpp ../src/gguf.cpp)
+set_target_properties(hadamard_rotate_gpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(hadamard_rotate_gpu_test PRIVATE ../include)
+target_link_libraries(hadamard_rotate_gpu_test PRIVATE si_quant CUDA::cudart)
+add_test(NAME hadamard_rotate_gpu_test COMMAND hadamard_rotate_gpu_test)
+
+# Links the whole runtime rather than si_gemm alone: si_gemm's other translation units reach
+# across to si_fused, so pulling it in on its own leaves those references undefined.
+add_executable(gemv_ptq1_gpu_test gemv_ptq1_gpu_test.cpp)
+set_target_properties(gemv_ptq1_gpu_test PROPERTIES CXX_STANDARD 17)
+target_include_directories(gemv_ptq1_gpu_test PRIVATE ../include)
+target_link_libraries(gemv_ptq1_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME gemv_ptq1_gpu_test COMMAND gemv_ptq1_gpu_test)
