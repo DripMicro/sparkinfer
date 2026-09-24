@@ -1855,6 +1855,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // the two independent proj() calls. Default on with either fp8 projection path (dense >96k GDN
     // or MoE); SPARKINFER_PREFILL_FP8_GDN_SHAREQ=0 restores the per-projection quantize (A/B).
     const char* _pshareq = getenv("SPARKINFER_PREFILL_FP8_GDN_SHAREQ");
+    // Whether the fused quantized-B GEMM can run at this pass's M at all. Past its limit the
+    // launcher declines and the caller falls back to materializing -- after having already given
+    // up the residual-fused int8 GEMM to try it. Only the dense-GGUF population whose row scales
+    // qwen35.cpp places under SPARKINFER_PREFILL_QB_DENSE is re-routed on this; Muse and the
+    // compressed-tensors checkpoints keep exactly the path they had.
+    const bool qb_dense_pass = s.gguf && !c.muse_glimmer && !moe;
+    const bool qb_fires = N <= kernels::pf_dense_gemm_qi8_max_m();
     const bool fp8_shareq = (use_fp8_gdn || moe_fp8) && (!_pshareq || _pshareq[0] != '0');
     auto gdn_qkv_z = [&](const bf16* A, const Qwen35LayerWeights& w, bool norm_deferred) {
         // Checkpoint-native NVFP4: quantize xn to FP4 ONCE (both projections read it) and run two
@@ -1903,8 +1910,37 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             kernels::launch_prefill_quantize_rows_fp8(wb, W_i8, sw, lvdim, H, st);
             kernels::launch_prefill_gemm_fp8(A_i8, W_i8, sx, sw, lz, N, lvdim, H, st);
         } else {
-            proj(A, w.wqkv,      w.wqkv_type,      b8, lqkv,  H);   // qkv
-            proj(A, w.wqkv_gate, w.wqkv_gate_type, lz, lvdim, H);   // z gate
+            // Fused quantized-B when the row scales exist (proj_fused falls back to proj when they
+            // do not), so a GDN layer stops materializing an int8 copy of wqkv/wqkv_gate -- on a
+            // 27B hybrid that is 10240+6144 rows of H per layer, on 48 of 64 layers.
+            //
+            // Both read the same activation, which is what the grouped launch wants: one kernel
+            // covering both output widths, so the pair costs one launch and one tail wave instead
+            // of two. The ffn gate/up pair and the attention q/k/v triple already group; this was
+            // the last co-located pair on the dense path.
+            // SPARKINFER_PREFILL_QB_GDN_GROUP=0 keeps it as two launches (A/B).
+            static const bool gdn_group_on = [] {
+                const char* e = getenv("SPARKINFER_PREFILL_QB_GDN_GROUP");
+                return !(e && e[0] == '0');
+            }();
+            bool gdn_grouped = false;
+            if (gdn_group_on && use_i8 && w.wqkv_rs && w.wqkv_gate_rs &&
+                w.wqkv_gate_type == w.wqkv_type &&
+                kernels::pf_dense_gemm_qi8_supported(w.wqkv_type)) {
+                const void*  Wg[2]  = { w.wqkv, w.wqkv_gate };
+                const float* rsg[2] = { w.wqkv_rs, w.wqkv_gate_rs };
+                void*        Cg[2]  = { b8, lz };
+                const int    ng[2]  = { lqkv, lvdim };
+                quant_a_i8(A, N, H);
+                gdn_grouped = kernels::launch_prefill_gemm_qi8_dense_group(
+                    w.wqkv_type, A_i8, sx, Wg, rsg, Cg, ng, 2, N, H, st,
+                    qb_partials, QB_SPLITS, qb_partials_cap,
+                    nullptr, nullptr, nullptr, apk());
+            }
+            if (!gdn_grouped) {
+                proj_fused(A, w.wqkv,      w.wqkv_type,      w.wqkv_rs,      b8, lqkv,  H);   // qkv
+                proj_fused(A, w.wqkv_gate, w.wqkv_gate_type, w.wqkv_gate_rs, lz, lvdim, H);   // z gate
+            }
         }
     };
 
@@ -2042,8 +2078,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 }
             }
             if (!out_fp4) {
-                attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
-                if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+                // Same trade the o-projection makes: with row scales, give up proj_resid's fused
+                // residual add (that path materializes W_i8 to get it) for the fused weight decode.
+                // Only where the fused GEMM accepts this M -- past it, it would decline and the
+                // residual add would have been given up for nothing.
+                if (w.ssm_out_rs && qb_fires) {
+                    proj_fused(lnrm, w.ssm_out, w.ssm_out_type, w.ssm_out_rs, ao, H, lvdim);
+                    attn_fused = false;
+                } else {
+                    attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+                    if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
+                }
             }
             use_i8 = restore_i8_gdn;
         } else {
@@ -2396,7 +2441,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 if (!wo_fp4_done)
                     proj_fused_acc(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim, &attn_acc);
                 attn_fused = false;
-            } else if (w.wo_rs) {
+            } else if (w.wo_rs && (qb_fires || !qb_dense_pass)) {
                 proj_fused(att, w.wo, w.wo_type, w.wo_rs, ao, H, qdim);
                 attn_fused = false;
             } else {
@@ -2513,7 +2558,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_prefill_quantize_rows_i8(wb, dst, scale, n_out, K, st);
                 }
             };
+            // Only where a full chunk fits the fused GEMM's M limit: past it every chunk declines
+            // and re-materializes, and the down projection loses its fused residual add.
             const bool ffn_qi8 = use_i8 && ffn_i8_stage && w.gate_rs && w.up_rs &&
+                (!qb_dense_pass || FC <= kernels::pf_dense_gemm_qi8_max_m()) &&
                 kernels::pf_dense_gemm_qi8_supported(gate_pf_type);
             if (ffn_i8 && !ffn_qi8) {
                 dequant_w_i8(gate_pf_type, gate_pf, ffn_Wg_i8, ffn_swg, ffn, H);
