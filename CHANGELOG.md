@@ -3,11 +3,16 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
-## [Unreleased]
+## [0.5.12] — 2026-09-24
 
 **Ternary-Bonsai-2-27B loads and runs**, a 1.75-bit ternary quantization of Qwen3.8-27B whose
 weights live in a rotated basis. Teacher-forced over 107 positions of prose it scores PPL 8.07
-against the unquantized checkpoint's 4.46 through the same runtime.
+against the unquantized checkpoint's 4.46 through the same runtime. It is served folded by default
+(17.9 GB, 87.4 tok/s single-stream on an RTX 5090), or from its stored ternary blocks in 8.2 GB
+with `SPARKINFER_BONSAI_NATIVE=all`.
+
+A CUDA graph whose capture failed is no longer marked ready, and once the GPU context is lost a
+request gets a 503 before any device work is issued.
 
 ### Models
 
@@ -34,9 +39,9 @@ against the unquantized checkpoint's 4.46 through the same runtime.
 
 ### Fixed
 
-- **A failed CUDA-graph capture was marked ready, and a destroyed decode graph kept its handles.**
-  The decode, DSpark decode, prefill-position and verify graphs were marked ready even when ending
-  the capture or instantiating it failed, and a split-count change destroyed the decode graph
+- **A failed CUDA-graph capture was marked ready, and a destroyed decode graph kept its handles**
+  (#1136). The decode, DSpark decode, prefill-position and verify graphs were marked ready even when
+  ending the capture or instantiating it failed, and a split-count change destroyed the decode graph
   without clearing its handles. Either way a later replay, park or destroy could hand libcuda a
   graph that no longer existed. A graph is ready now only if both steps succeeded; a failed verify
   capture declines to the per-row path, which loses nothing because capture records rather than
@@ -86,12 +91,12 @@ against the unquantized checkpoint's 4.46 through the same runtime.
   the dp4a and fp8 activation staging beside it already follows -- a side stream rotating for
   itself is a write racing the main stream's read. All of it goes through one batched GEMM that
   is bit-identical per row to the single-row GEMV AR decode drives.
-- **The ternary GEMV stops paying local memory for every trit.** `pow3[m]` was a function-local
-  array indexed by a value that differs across the lanes of a warp, so it could not stay in
-  registers and each trit extraction took a local-memory load; and the 28-byte block was re-read
-  from global on each of four unrolled passes as scattered, data-dependent single-byte loads. A
-  select chain and one shared-memory staging per block: 1.9x on the full native path (16.0 to 29.8
-  tok/s single-stream, 17.9 to 34.3 at four concurrent), bit-identical, which
+- **The ternary GEMV stops paying local memory for every trit** (#1124). `pow3[m]` was a
+  function-local array indexed by a value that differs across the lanes of a warp, so it could not
+  stay in registers and each trit extraction took a local-memory load; and the 28-byte block was
+  re-read from global on each of four unrolled passes as scattered, data-dependent single-byte
+  loads. A select chain and one shared-memory staging per block: 1.9x on the full native path (16.0
+  to 29.8 tok/s single-stream, 17.9 to 34.3 at four concurrent), bit-identical, which
   `gemv_ptq1_gpu_test` checks against a host decoder and against N separate GEMVs.
 - **The Qwen3.8-27B family is recognised by shape** (#1124), not by the presence of an MTP block.
   A derivative without one was served under the default model name of an unrelated 35B MoE, and
