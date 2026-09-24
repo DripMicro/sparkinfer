@@ -3,6 +3,19 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- **A failed CUDA-graph capture was marked ready, and a destroyed decode graph kept its handles.**
+  The decode, DSpark decode, prefill-position and verify graphs were marked ready even when ending
+  the capture or instantiating it failed, and a split-count change destroyed the decode graph
+  without clearing its handles. Either way a later replay, park or destroy could hand libcuda a
+  graph that no longer existed. A graph is ready now only if both steps succeeded; a failed verify
+  capture declines to the per-row path, which loses nothing because capture records rather than
+  runs. Once the CUDA context is lost, a request gets a 503 before any device work, rather than the
+  prefix-cache handling issuing graph destroys against the dead context.
+
 ## [0.5.11] — 2026-09-24
 
 **serve-dspark no longer dies with a segfault inside libcuda.** A short prompt's prefill is replayed
