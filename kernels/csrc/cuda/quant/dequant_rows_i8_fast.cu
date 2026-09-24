@@ -36,6 +36,7 @@
 #include "sparkinfer/kernels/qtype.h"
 
 #include <cstdlib>
+#include <type_traits>
 
 namespace sparkinfer {
 namespace kernels {
@@ -141,28 +142,59 @@ constexpr int DQR_BLOCK = 256, DQR_VEC = 4;   // 4 consecutive values/thread => 
 // costs more occupancy than the extra threads cost. Widening the block instead keeps NG small
 // (BLK=1024 => NG=5 for the same row). Value->thread mapping is unchanged, so the decode, the
 // amax and the stores are all bit-identical whatever BLK is.
-template <int QT, int NG, int BLK = DQR_BLOCK>
+template <int QT, int NG, int BLK = DQR_BLOCK, int VEC = DQR_VEC, bool Q4FAST = true>
 __global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
         const unsigned char* __restrict__ src, signed char* __restrict__ q,
         float* __restrict__ scale, int cols) {
     constexpr int BS = dqr_bs<QT>();
-    constexpr int GSPAN = BLK * DQR_VEC;                     // values per group
+    constexpr int GSPAN = BLK * VEC;                         // values per group
     const int row = blockIdx.x, t = threadIdx.x;
     const int nsb = cols >> 8;
     const unsigned char* rbase = src + (size_t)row * nsb * BS;
 
-    float v[NG][DQR_VEC];
+    float v[NG][VEC];
     float amax = 0.f;
     #pragma unroll
     for (int g = 0; g < NG; g++) {
-        const int base = g * GSPAN + t * DQR_VEC;            // 4-aligned => one super-block
+        const int base = g * GSPAN + t * VEC;                // VEC-aligned => one super-block
         if (base < cols) {
             const unsigned char* blk = rbase + (size_t)(base >> 8) * BS;
             const int off = base & 255;
-            #pragma unroll
-            for (int i = 0; i < DQR_VEC; i++) {
-                v[g][i] = dqr_val<QT>(blk, off + i);
-                amax = fmaxf(amax, fabsf(v[g][i]));
+            if constexpr (Q4FAST && QT == DQR_Q4_K) {
+                // VEC is 4 or 8 and base is VEC-aligned, so the run stays inside one 32-wide
+                // nibble half and one super-block. Same nibbles as dqr_q4k_val.
+                const float d = dqr_h2f(blk), dmin = dqr_h2f(blk + 2);
+                const unsigned char* sc = blk + 4;
+                const unsigned char* qs = blk + 16;
+                const int j64 = off >> 6, r = off & 63, l = r & 31, hi = r >> 5;
+                const int j = 2 * j64 + hi;
+                int s, m;
+                if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
+                else {
+                    s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+                    m = (sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4);
+                }
+                const float ds = d * (float)s, dm = dmin * (float)m;
+                unsigned words[2];
+                if constexpr (VEC == 8) {
+                    const uint2 p = *reinterpret_cast<const uint2*>(qs + j64 * 32 + l);
+                    words[0] = p.x; words[1] = p.y;
+                } else {
+                    words[0] = *reinterpret_cast<const unsigned*>(qs + j64 * 32 + l);
+                }
+                #pragma unroll
+                for (int i = 0; i < VEC; i++) {
+                    const unsigned char byte = (unsigned char)((words[i >> 2] >> (8 * (i & 3))) & 0xFFu);
+                    const int nib = hi ? (byte >> 4) : (byte & 0xF);
+                    v[g][i] = ds * (float)nib - dm;
+                    amax = fmaxf(amax, fabsf(v[g][i]));
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < VEC; i++) {
+                    v[g][i] = dqr_val<QT>(blk, off + i);
+                    amax = fmaxf(amax, fabsf(v[g][i]));
+                }
             }
         }
     }
@@ -186,12 +218,15 @@ __global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
     signed char* qrow = q + (size_t)row * cols;
     #pragma unroll
     for (int g = 0; g < NG; g++) {
-        const int base = g * GSPAN + t * DQR_VEC;
+        const int base = g * GSPAN + t * VEC;
         if (base < cols) {
-            signed char o[DQR_VEC];
+            signed char o[VEC];
             #pragma unroll
-            for (int i = 0; i < DQR_VEC; i++) o[i] = (signed char)(int)roundf(v[g][i] * inv);
-            *reinterpret_cast<unsigned*>(&qrow[base]) = *reinterpret_cast<const unsigned*>(o);
+            for (int i = 0; i < VEC; i++) o[i] = (signed char)(int)roundf(v[g][i] * inv);
+            if constexpr (VEC == 8)
+                *reinterpret_cast<uint2*>(&qrow[base]) = *reinterpret_cast<const uint2*>(o);
+            else
+                *reinterpret_cast<unsigned*>(&qrow[base]) = *reinterpret_cast<const unsigned*>(o);
         }
     }
 }
@@ -199,21 +234,51 @@ __global__ __launch_bounds__(BLK) void deq_rows_i8_vec_kernel(
 template <int QT>
 bool dispatch(const unsigned char* s, signed char* q, float* scale, int rows, int cols,
               cudaStream_t stream) {
-    const int ng = (cols + DQR_BLOCK * DQR_VEC - 1) / (DQR_BLOCK * DQR_VEC);
-    if (ng <= 1)       deq_rows_i8_vec_kernel<QT, 1><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else if (ng <= 4)  deq_rows_i8_vec_kernel<QT, 4><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else if (ng <= 8)  deq_rows_i8_vec_kernel<QT, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else if (ng <= 12) deq_rows_i8_vec_kernel<QT, 12><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
-    else {
-        // Beyond 12 groups the register array is the binding constraint, not the thread count:
-        // Muse Glimmer's ffn_down (cols=19968) would need NG=20 at 256 threads = 80 floats/thread.
-        // A 1024-wide block covers the same row in NG=5, so widen the block instead of growing NG.
-        constexpr int WBLK = 1024, WSPAN = WBLK * DQR_VEC;
-        const int ngw = (cols + WSPAN - 1) / WSPAN;
-        if (ngw <= 5)      deq_rows_i8_vec_kernel<QT, 5, WBLK><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
-        else if (ngw <= 8) deq_rows_i8_vec_kernel<QT, 8, WBLK><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
-        else return false;                               // wider than the register budget
+    // Q4 rows whose width is a multiple of 2048 give each thread 8 values in one nibble
+    // half: one ld.64 and one scale unpack instead of two ld.32s.
+    // SPARKINFER_DEQUANT_Q4_VEC8=0 restores the 4-wide load.
+    static const int vec8 = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_Q4_VEC8");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if constexpr (QT == DQR_Q4_K) {
+        if (!vec8) { /* fall through to VEC=4 */ }
+        else {
+        constexpr int SPAN8 = DQR_BLOCK * 8;
+        if (cols >= SPAN8 && (cols % SPAN8) == 0) {
+            const int ng8 = cols / SPAN8;
+            if (ng8 == 1)      { deq_rows_i8_vec_kernel<QT, 1, DQR_BLOCK, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols); return true; }
+            if (ng8 == 2)      { deq_rows_i8_vec_kernel<QT, 2, DQR_BLOCK, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols); return true; }
+            if (ng8 == 3)      { deq_rows_i8_vec_kernel<QT, 3, DQR_BLOCK, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols); return true; }
+            if (ng8 == 4)      { deq_rows_i8_vec_kernel<QT, 4, DQR_BLOCK, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols); return true; }
+            if (ng8 <= 6)      { deq_rows_i8_vec_kernel<QT, 6, DQR_BLOCK, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols); return true; }
+            if (ng8 <= 8)      { deq_rows_i8_vec_kernel<QT, 8, DQR_BLOCK, 8><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols); return true; }
+        }
+        }
     }
+    const int ng = (cols + DQR_BLOCK * DQR_VEC - 1) / (DQR_BLOCK * DQR_VEC);
+    // VEC8=0 is the old per-value Q4 unpack (Q4FAST=false). The default path keeps the
+    // shared scale and, when the row allows it, the 8-wide load above.
+    constexpr bool kFast = true;
+    const bool fast = vec8 || QT != DQR_Q4_K;
+    auto launch4 = [&](auto fast_tag) {
+        constexpr bool F = decltype(fast_tag)::value;
+        if (ng <= 1)       deq_rows_i8_vec_kernel<QT, 1, DQR_BLOCK, DQR_VEC, F><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+        else if (ng <= 4)  deq_rows_i8_vec_kernel<QT, 4, DQR_BLOCK, DQR_VEC, F><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+        else if (ng <= 8)  deq_rows_i8_vec_kernel<QT, 8, DQR_BLOCK, DQR_VEC, F><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+        else if (ng <= 12) deq_rows_i8_vec_kernel<QT, 12, DQR_BLOCK, DQR_VEC, F><<<rows, DQR_BLOCK, 0, stream>>>(s, q, scale, cols);
+        else {
+            constexpr int WBLK = 1024, WSPAN = WBLK * DQR_VEC;
+            const int ngw = (cols + WSPAN - 1) / WSPAN;
+            if (ngw <= 5)      deq_rows_i8_vec_kernel<QT, 5, WBLK, DQR_VEC, F><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
+            else if (ngw <= 8) deq_rows_i8_vec_kernel<QT, 8, WBLK, DQR_VEC, F><<<rows, WBLK, 0, stream>>>(s, q, scale, cols);
+            else return false;
+        }
+        return true;
+    };
+    (void)kFast;
+    if (fast) return launch4(std::true_type{});
+    return launch4(std::false_type{});
     return true;
 }
 
