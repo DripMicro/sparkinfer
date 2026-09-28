@@ -3,11 +3,52 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
-## [Unreleased]
+## [0.5.13] — 2026-09-28
+
+**The server scales with concurrency again.** Since #1088, a request that sets no sampler takes the checkpoint's `generation_config`. Packed decode took only greedy requests, so those requests decoded one at a time: about 90 tok/s on an RTX 5090 however many users. Now:
+- sampled requests pack;
+- the first token of a sampled response is sampled too;
+- the HTTP pool no longer caps concurrent streams at the CPU count;
+- long prompts are no longer starved under steady load.
+
+Measured with AIPerf on the release Qwen3.8-27B NVFP4 checkpoint against vLLM 0.30.0 on the same card:
+- equal or faster for a single request on every load;
+- equal or faster for chat and long answers at four concurrent requests;
+- 0.62–0.89× for chat and long answers at 16 and 32;
+- 0.78–0.87× for 8K prompts at 4–32 concurrent requests, where it was 0.34–0.40×.
+
+The release container defaults to `CTX=131072`.
+
+### Performance
+
+Merged by the eval bots since 0.5.12. Each gain is on the RTX 5090 eval box against the same-box
+`main` of its round.
+
+- **Ternary-Bonsai-2-27B**:
+  - **decode**: the decode shadow streams every weight but the embedding at 1.75 bits (#1166, #1167; 1.11–1.2x cb-decode);
+  - **packed decode**: rows read the shadow's FFN on the int8 tensor cores (#1161, #1164; 1.43x cb-decode @c16, 1.33x @c8), and the ternary rows kernel runs branch-free (#1170; 1.11x @c2);
+  - **single-row decode**: builds its dp4a table once per CTA (#1173; 1.08x decode @128);
+  - **long prefill**: the FFN runs on the FP4 tensor cores (#1186; 1.34x prefill @16k);
+  - **short prefill**: decodes straight to FP4 (#1189; 1.21x @512), stages each activation tile once per SM (#1169; 1.36x @128), and prefills a small load as one pack (#1193);
+  - **dense-GGUF prefill**, which Bonsai shares with every dense GGUF:
+    - Q4_K is decoded inside the GEMM (#1139; 1.94x prefill @128);
+    - bf16 on k-tiled `mma.sync` (#1148; 1.24x @512);
+    - the fused Q4_K GEMM gets its own decode warps and a 256-row tile (#1163; 1.28x @512);
+    - smaller gains from #1143, #1145, #1152, #1155 and #1162.
+- **Muse Glimmer**:
+  - **packed decode**: scores attention on the bf16 tensor cores (#1182; 1.24x cb-decode @c32);
+  - **batched prefill**: keeps its converted NVFP4 operands (#1185; 1.2x prefill @512);
+  - **prefill attention**: runs register-resident per token (#1179; 1.19x prefill @64k);
+  - **short prefill**: keeps its split Q4_K GEMMs on the wide tile (#1191; 1.11x prefill @128);
+  - **token table**: stays in Q4_K, freeing 1.9 GB (#1194; 1.07x prefill @512, 1.06x cb-decode @c32);
+  - **int8-KV decode attention**: runs PV on `mma.sync` (#1195; 1.02x decode @64k).
+- **Qwen3.8-27B**: packed rows read the Q4_K projections, the FP8-stored FFN and the LM head on the
+  fp16 tensor cores (#1192).
 
 ### Serving
 
-- **Concurrent load no longer stalls on the HTTP pool, long prompts or prefix-cache snapshots.**
+- **Concurrent load no longer stalls on the HTTP pool, long prompts or prefix-cache snapshots**
+  (#1203).
   - **HTTP pool:** it was one worker per CPU, and a streaming request holds one for its whole life. On a 24-CPU box, stream 24 waited for another to finish. The pool is now 256 (`SPARKINFER_HTTP_THREADS`).
   - **Long prompts:** a prompt over `SPARKINFER_PREFILL_MIX_MAX` waited for decode to drain, which it never does under steady load. One such prefill is now admitted per step (`SPARKINFER_LONG_PREFILLS_PER_STEP`), and equal priorities go in arrival order.
   - **Snapshots:** prefix-cache snapshots reuse their pinned buffers instead of pinning ~205 MB each.
@@ -15,7 +56,7 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     - chat c32: 480 → 645, TTFT p99 46 s → 7 s;
     - 1k-token answers c32: 1,028 → 1,395, TTFT p99 81 s → 0.9 s;
     - 8K prompts c16: 64 → 149 and c32: 62 → 150, TTFT p99 127 s → 12 s and 196 s → 26 s.
-- **Sampled requests batch again.** The continuous-batch engine's packed decode took only greedy
+- **Sampled requests batch again** (#1201). The continuous-batch engine's packed decode took only greedy
   rows, and since requests that set no sampler take the checkpoint's `generation_config`
   (temperature 1.0 on Qwen3.8), nearly every server request decoded one forward per sequence:
   aggregate throughput stayed at single-stream speed (~90 tok/s on an RTX 5090) at any
@@ -25,12 +66,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   AIPerf on the release Qwen3.8-27B NVFP4 checkpoint (`--ctx 131072`, default sampling): 3.0x /
   5.8x / 5.5x output throughput for 1k-token chat at 4 / 16 / 32 concurrent requests, 3.5x /
   10.5x / 12.5x for 1k-token answers.
-- **The first token of a sampled response is sampled.** It was the prefill's argmax whatever the
+- **The first token of a sampled response is sampled** (#1202). It was the prefill's argmax whatever the
   request's temperature, top-k, top-p or seed, so every sampled response to one prompt began with
   the same token. It is now drawn from the same logits with `forward_token`'s sampler at sampler
   step 0 (decode starts at 1), in single and packed prefill alike, and its logprob describes the
   drawn token. Greedy requests, forced tokens and the exclusive prefix session keep the argmax.
-- **The release container defaults to `CTX=131072`.** The full 262,144-token pool left ~3 GB on a
+- **The release container defaults to `CTX=131072`** (#1201). The full 262,144-token pool left ~3 GB on a
   32 GB card: packed decode and batched prefill could not allocate, and 16 concurrent 8K-token
   prompts stalled the server. `-e CTX=262144` still serves the full context to one conversation at
   a time, and the server now warns at startup when less than 5 GiB is free after loading.
@@ -38,7 +79,7 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 ### Project
 
 - **The Qwen3.8 bot checks that the server still batches** (`eval/serve_concurrency.py`, guard
-  3d).
+  3d, #1204).
   - **What it runs:** `sparkinfer_server` on the ModelOpt release checkpoint. It sends one chat request, then 16 at once, both with default sampling and with an explicit temperature.
   - **Floor:** the aggregate must reach 3× a single stream wherever `main`'s does. It measures 11.6× on `main` and 1.04× with packed decode off.
   - **Why:** every other concurrency number drives the engine with greedy requests, which is how #1088 went unseen for two weeks.
