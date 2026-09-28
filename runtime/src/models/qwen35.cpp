@@ -684,6 +684,12 @@ struct Qwen35Model::Impl {
     // Pinned staging for set_logit_bias_dense (cfg.vocab floats), allocated on first use: only
     // constrained requests ever need it.
     float* h_dense_bias = nullptr;
+    // Prefix-cache checkpoints the next prefill_batched() takes inside its pass, set only for the
+    // span of one ingest_prompt_checkpointed() call (Qwen35PrefillCtx::ckpt_*).
+    int pending_ckpt_n = 0;
+    const int* pending_ckpt_rows = nullptr;
+    void* const* pending_ckpt_host = nullptr;
+    size_t pending_ckpt_state_bytes = 0;
     float* logits;
     int *d_scalars, *d_tok, *d_out_id, *d_pos, *d_seqlen, *d_writepos, *d_shared_ids;
     int *d_cap_row = nullptr;   // dflash capture row, packed into d_scalars[4]
@@ -3895,6 +3901,49 @@ int Qwen35Model::sample_seed_token(float temperature, unsigned long long seed,
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
                                  int pos0) {
     Impl& s = *p_;
+    // The block-scaled NVFP4 GEMMs take a row count that is a multiple of 8
+    // (prefill_nvfp4_supported), and a pass whose length is not one runs EVERY layer on the
+    // fallback. Measured on an RTX 5090, Qwen3.8-27B NVFP4, prefill tok/s: 15,146 at 1024 against
+    // 5,455 at 1030, 16,748 at 2048 against 7,275 at 2054, 15,199 at 8192 against 7,567 at 8210 --
+    // seven prompt lengths in eight took the slow arm, and nothing measured it because every
+    // scored context is a round number. So prefill the aligned body in one pass and feed the last
+    // 1-7 tokens through forward_token: the decode step, ~10 ms each, and the arithmetic every
+    // later token gets anyway. A prefix-cache checkpoint always falls inside the body (it is at
+    // least 16 tokens short of the end). Not for a pass with image or MRoPE staging, whose rows
+    // are the whole prompt's, or a DSpark hidden-state capture, which records the pass itself.
+    // Split this way, prefill tok/s at 131 / 262 / 518 / 1030 / 2054 / 4102 / 8210 tokens went
+    // 1,297 -> 2,242 / 2,372 -> 2,925 / 3,817 -> 4,886 / 5,455 -> 7,813 / 7,281 -> 10,914 /
+    // 7,291 -> 13,039 / 7,574 -> 14,350; 135 (the worst tail, seven decode steps behind a 128-row
+    // pass) still gains, and aligned lengths do not change. SPARKINFER_PREFILL_ALIGN8_MIN is the
+    // smallest body split this way (0 turns it off).
+    static const int align8_min = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ALIGN8_MIN");
+        const int v = e ? atoi(e) : 128;
+        return v < 0 ? 0 : v;
+    }();
+    const int body = n & ~7;
+    if (align8_min > 0 && body >= align8_min && body < n && !s.w.layers.empty() &&
+        s.w.layers[0].gate_fp4 && !s.d_vision_emb && !s.d_mrope_pos && !s.dflash_capture) {
+        if (prefill_batched(prompt_ids, body, false, pos0) < 0) return -1;   // nothing landed
+        int seed = -1;
+        for (int i = body; i < n; ++i) seed = forward_token(prompt_ids[i], pos0 + i, i + 1 == n);
+        // The last step counted its pick toward presence/frequency penalties, which a batched
+        // prefill's seed never is: take that one count back so the request sees the same counts
+        // whichever way its prompt was split. forward_token has synchronized its stream.
+        if (seed >= 0 && seed < s.cfg.vocab && s.penalty_counts) {
+            int count = 0;
+            cu(cudaMemcpyAsync(&count, s.penalty_counts + seed, sizeof(int), cudaMemcpyDeviceToHost,
+                               s.stream), "prefill tail count read");
+            cu(cudaStreamSynchronize(s.stream), "prefill tail count sync");
+            if (count > 0) {
+                --count;
+                cu(cudaMemcpyAsync(s.penalty_counts + seed, &count, sizeof(int), cudaMemcpyHostToDevice,
+                                   s.stream), "prefill tail count write");
+                cu(cudaStreamSynchronize(s.stream), "prefill tail count write sync");
+            }
+        }
+        return seed;
+    }
     // A long batched prefill needs the scratch arena more than a wide decode needs the head, and
     // on a 32-GB card the two do not both fit: measured at ctx=32768 the arena wants 3.6 GB and
     // the head operand's 0.81 GB is enough to make it fail, which drops the WHOLE prompt onto the
@@ -3949,6 +3998,10 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
                           s.d_vision_emb, s.d_vision_pos, s.vision_n,
                           // MRoPE rotary positions, null unless set_pending_mrope ran for this prompt.
                           s.d_mrope_pos };
+    ctx.ckpt_n = s.pending_ckpt_n;
+    ctx.ckpt_rows = s.pending_ckpt_rows;
+    ctx.ckpt_host = s.pending_ckpt_host;
+    ctx.ckpt_state_bytes = s.pending_ckpt_state_bytes;
     // The shadow's ternary legs for batched prefill, while it holds them (see prefill_batched_run).
     if (!s.bonsai_dec_layers.empty() && s.bonsai_dec_rs.size() == s.bonsai_dec_layers.size()) {
         ctx.bonsai_pf_layers = s.bonsai_dec_layers.data();
@@ -4414,6 +4467,70 @@ bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapsh
     out.state_bytes = st_bytes;
     out.conv_bytes = cv_bytes;
     return true;
+}
+
+int Qwen35Model::ingest_prompt_checkpointed(const int* ids, int start, int end, const int* ckpts,
+                                            int n_ckpts, RecurrentStateSnapshot* snaps, int* out_pos,
+                                            bool want_seed_logprob) {
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
+    Impl& s = *p_;
+    if (out_pos) *out_pos = start;
+    const int n = end - start;
+    if (!ids || start < 0 || n <= 0 || !ckpts || !snaps || n_ckpts <= 0 || n_ckpts > 8) return -1;
+    // A model with no recurrent state has nothing to capture; its caller keeps the per-segment
+    // route, which costs it nothing but the extra pass.
+    if (!needs_linear_state(s.cfg)) return -1;
+    // Ascending and strictly inside, every segment long enough that its conv window is its own rows.
+    constexpr int kMinSegment = 16;
+    for (int i = 0, prev = start; i <= n_ckpts; ++i) {
+        const int at = i < n_ckpts ? ckpts[i] : end;
+        if (at - prev < kMinSegment) return -1;
+        prev = at;
+    }
+    auto it = s.sessions.find(s.active_seq_id);
+    if (s.active_seq_id == 0 || it == s.sessions.end() || !it->second.lin_state ||
+        !it->second.lin_conv_state)
+        return -1;
+    // Exactly the one pass ingest_prompt_range would run for this range, or nothing.
+    if (s.d_vision_emb || s.d_mrope_pos || !batched_prefill_windowed_enabled(s.gguf, s.cfg, n, s.kv) ||
+        n > prefill_single_pass_max_tokens(s.kv))
+        return -1;
+    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+                            s.cfg.linear_head_dim * sizeof(float);
+    const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim *
+                            sizeof(bf16);
+    std::vector<std::shared_ptr<void>> bufs((size_t)n_ckpts);
+    std::vector<void*> host((size_t)n_ckpts);
+    std::vector<int> rows((size_t)n_ckpts);
+    for (int i = 0; i < n_ckpts; ++i) {
+        bufs[(size_t)i] = pinned_snapshot_buffer(st_bytes + cv_bytes);
+        if (!bufs[(size_t)i]) return -1;
+        host[(size_t)i] = bufs[(size_t)i].get();
+        // The pass writes the GDN layers' windows; the attention layers' slots, which nothing
+        // reads, are zero rather than whatever a reused buffer held.
+        memset(static_cast<char*>(host[(size_t)i]) + st_bytes, 0, cv_bytes);
+        rows[(size_t)i] = ckpts[i] - start;
+    }
+    s.pending_ckpt_n = n_ckpts;
+    s.pending_ckpt_rows = rows.data();
+    s.pending_ckpt_host = host.data();
+    s.pending_ckpt_state_bytes = st_bytes;
+    // prefill_batched's tail synchronizes the stream to read the seed back, so the snapshot
+    // copies the pass queued behind each checkpoint's segment have landed when it returns.
+    const int seed = prefill_batched(ids + start, n, want_seed_logprob, start);
+    s.pending_ckpt_n = 0;
+    s.pending_ckpt_rows = nullptr;
+    s.pending_ckpt_host = nullptr;
+    s.pending_ckpt_state_bytes = 0;
+    // A pass declines before its first kernel runs (see prefill_batched_resume), so nothing landed.
+    if (seed < 0) return -1;
+    for (int i = 0; i < n_ckpts; ++i) {
+        snaps[i].host = std::move(bufs[(size_t)i]);
+        snaps[i].state_bytes = st_bytes;
+        snaps[i].conv_bytes = cv_bytes;
+    }
+    if (out_pos) *out_pos = end;
+    return seed;
 }
 
 bool Qwen35Model::restore_recurrent_state(uint64_t seq_id, const RecurrentStateSnapshot& snap) {
