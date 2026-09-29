@@ -3,11 +3,34 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
-## [Unreleased]
+## [0.5.14] — 2026-09-29
+
+**Prefill no longer falls off the fast path on seven prompt lengths in eight.**
+- The NVFP4 GEMMs take multiples of 8 rows, and any other length used to run every layer on the fallback at half the speed or less. That affected every uncached prompt whose length is not a multiple of 8.
+- Chat prompts also stop paying a second pass and a sync for their prefix-cache checkpoint.
+
+Against v0.5.13 (AIPerf, release Qwen3.8-27B NVFP4, RTX 5090):
+- chat throughput at 16 / 32 concurrent requests +7% / +11%;
+- 8K prompts at 16 / 32 +5%;
+- a single uncached 8K prompt's time to first token 1,103 → 616 ms.
+
+Against vLLM 0.30.0 on the same card:
+- equal or faster for every load at one request;
+- equal or faster for chat and long answers at four;
+- 0.69–0.91× at 16–32.
+
+A prefill pass also holds the device lock now, so a request admitted during its graph capture can no longer break the stream.
+
+### Fixed
+
+- **A request admitted while a prefill was capturing its CUDA graph could invalidate the capture** (#1208).
+  - **Cause:** the prefill pass's whole-prefill graph capture did not hold `device_mutex()`. A new session's penalty-count and logit-bias resets are memsets on the same stream.
+  - **Effect:** such a memset was recorded into the capture and broke it. Later calls on the stream failed ("operation failed due to a previous error during capture"), and requests of that burst stopped after a few tokens.
+  - **Fix:** `prefill_batched` takes the lock, as `forward_token` and the packed paths already did.
 
 ### Performance
 
-- **Prefill of a prompt whose length is not a multiple of 8 is up to 1.9x faster.**
+- **Prefill of a prompt whose length is not a multiple of 8 is up to 1.9x faster** (#1207).
   - **Cause:** the NVFP4 prefill GEMMs take a row count that is a multiple of 8, so such a pass ran every layer on the fallback.
   - **Scale:** that is seven prompt lengths in eight. Qwen3.8-27B NVFP4, RTX 5090, prefill tok/s:
     - 15,146 at 1024 against 5,455 at 1030;
@@ -19,7 +42,7 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
     - Muse Glimmer at 4102: 7,575 → 15,066.
 
     Aligned lengths do not change.
-- **A prefix-cache checkpoint is taken inside the one prefill pass.**
+- **A prefix-cache checkpoint is taken inside the one prefill pass** (#1207).
   - **Before:** a request with a checkpoint was prefilled in one pass per segment, with a snapshot of the recurrent state between. For a chat request that meant a second, eager pass over its last 10–25 tokens and a device-wide sync.
   - **Now:** each Gated-DeltaNet layer runs its conv and scan once per segment, carrying the state across, and copies the state out at the checkpoint (`Qwen35Model::ingest_prompt_checkpointed`).
   - **Accuracy:** the snapshot is bit-identical to the old one for a checkpoint up to 515 tokens from the end. Under `SPARKINFER_DETERMINISTIC=1`, a cache hit from it reproduces the old hit exactly (`prefix_resume_check`, which now measures this route too).
