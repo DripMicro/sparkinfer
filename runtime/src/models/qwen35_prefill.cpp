@@ -1263,12 +1263,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // arena addresses are what
     // a captured prefill graph can safely replay. A failed arena alloc hands back nullptr
     // and the layer keeps the int8 path. SPARKINFER_MUSE_NVFP4_WO_STREAM=0 restores it (A/B in ONE
-    // binary); _WO_MINN sets the smallest prompt that converts (the down leg's 512 by default).
+    // binary); _WO_MINN sets the smallest prompt that converts (128; 512 keeps o on the
+    // int8 GEMM at the 128-token prompt).
     static const bool wo_stream_on = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_STREAM"); return !(e && e[0] == '0');
     }();
     static const int wo_min = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 512;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 128;
     }();
     // Both streamed operands (o here, ffn_down below) convert Q4_K layers in ONE launch straight
     // from the GGUF bytes instead of dequant-to-bf16 slices plus a quantize over each: bit-identical
@@ -1307,10 +1308,12 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // that uses it. That second half is not a tidiness point: at max_seq 65536 the session has
     // essentially no spare VRAM, and 341 MB held across a 64k prefill costs 85% of it -- measured
     // with the buffers allocated and never read, so it is the footprint alone, not this path.
-    // Hence a floor: below dn_min the fixed conversion cost (52 layers) swamps a prefill that only
-    // takes ~36 ms. 1024 was that knee when staging was 341 MB; with the 32 MB slice the convert
-    // is cheap enough that the 2.34x GEMM already pays at the scored 512-token prompt. Set
-    // SPARKINFER_MUSE_NVFP4_{WO,DOWN}_MINN=1024 to restore main.
+    // Hence a floor: below it the conversion of 52 layers is a fixed cost on a prefill of a few
+    // tens of milliseconds. 1024 was that knee when staging was 341 MB; the 32 MB slice moved it
+    // to 512. The stream cache now pays the conversion once, beside the first pass, and the
+    // captured graph plus the scored reps read that operand. At 128 tokens the narrow NVFP4 tile
+    // then beats the int8 GEMM on both down and o. SPARKINFER_MUSE_NVFP4_{WO,DOWN}_MINN=512
+    // restores the int8 legs at that prompt.
     //
     // There used to be a CEILING as well, at 8192, and it was the 265.8 MB bf16 staging that put it
     // there -- 78% of that 341 MB. But the staging is a pure INTERMEDIATE: launch_gguf_dequant
@@ -1331,7 +1334,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // the int8 path and replay cannot touch a cudaFree'd address -- which is what a per-call
     // cudaMalloc/cudaFree pair did on the third sighting of N.
     static const int dn_min = [] {
-        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 512;
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 128;
     }();
     static const int dn_max = [] {
         const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MAXN"); return e ? atoi(e) : (1 << 30);

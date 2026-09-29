@@ -7916,7 +7916,7 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         if (fp4o_env)
             down_fp4_on = fp4o_env[0] == '1' || fp4o_env[0] == 'd';
         // o-proj prefix at 64k ate 52/52 copies (~0.8 GB) and dropped the 16k FFN chunk
-        // 4096 -> 1024. Down is worth ~4x more per byte; o stays streamed per layer from N=512.
+        // 4096 -> 1024. Down is worth ~4x more per byte; o stays streamed per layer from N=128.
         const bool wo_eligible = wo_fp4_on;
         const bool down_eligible = (!fp4o_env || fp4o_env[0] != '0') &&
                                    (down_fp4_on || prefix_long);
