@@ -7,6 +7,63 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A prompt's last 1-7 tokens take one forward instead of one decode step each** (a 1,076-token
+  chat prompt prefills in 96 ms instead of 131, on Qwen3.8-27B).
+  - **Before:** the NVFP4 prefill takes a multiple of 8 rows, so the aligned body ran as one
+    pass and the 1-7 tokens left over ran as decode steps (#1207), each a full weight read: ~40
+    ms for a 4-token tail. A small prefill pass for the tail was slower still, because it
+    displaced the cached whole-prefill graph.
+  - **Now:** the tail runs through the verify path -- the path greedy speculation relies on to
+    reproduce decode exactly -- in one forward, eagerly and outside the verify graph cache so the
+    packed decode's graphs are never evicted, committing every row
+    (`Qwen35Model::ingest_tail_rows`). A seed whose logprob is wanted, or a session with a logit
+    bias, keeps the decode steps. It has its own 149 MB arena, so it never re-allocates the
+    buffers the packed decode's graphs point at. `SPARKINFER_PREFILL_TAIL_VERIFY=0` restores them.
+  - **Tested:** through `sparkinfer_server` under `SPARKINFER_DETERMINISTIC=1`, 18/18 completions
+    (T=0, 0.7, 1.0) identical with the tail on and off; `pack_ckpt_check` gives the same seeds and
+    snapshots either way.
+
+### Fixed
+
+- **A verify pass that did not record a CUDA graph began one anyway.** `dflash_verify_short_run`'s
+  `if (recording)` guarded the FP8 memset loop instead of `cudaStreamBeginCapture`, so a
+  non-recording pass left the stream capturing and every later call on it failed ("operation not
+  permitted when stream is capturing"). DSpark never reached it because it warms every width
+  first; the eager tail above is the first caller that does not record.
+
+- **Chat prompts that arrive together are prefilled together** (chat c16 TTFT p50 2.04 -> 1.08 s,
+  696 -> 765 tok/s on Qwen3.8-27B).
+  - **Before:** packed prompt prefill refused any prompt with a prefix-cache checkpoint, and a
+    chat request past the checkpoint minimum always has one. So a wave of chat prompts -- up to
+    11 at once at c16 -- went through one pass each, ~131 ms apiece, while every decoding
+    request waited.
+  - **Now:** a pack takes prompts with one checkpoint each. Such a prompt's Gated-DeltaNet conv
+    and scan run in two parts, and the state goes to its snapshot between them, exactly as the
+    one-prompt pass does it. A pack whose length is not a multiple of 8 would lose the NVFP4
+    GEMMs for every layer, so one prompt's last 1-7 tokens run as decode steps after the pass.
+    `SPARKINFER_PACK_CHECKPOINTS=0` keeps checkpointed prompts on the one-prompt path.
+  - **Tested:** `pack_ckpt_check` prefills three chat-length prompts alone and packed: under
+    `SPARKINFER_DETERMINISTIC=1` the seeds and the snapshots are bit-identical, the trimmed
+    prompt included.
+
+- **A chat request no longer pins 205 MB on its prefill's critical path** (1.19x chat
+  throughput at 16 concurrent requests; a lone 1K-token chat prompt's time to first token
+  208 -> 137 ms, on Qwen3.8-27B).
+  - **Before:** a prompt past the prefix-cache checkpoint minimum snapshots its recurrent state
+    (~205 MB) into pinned memory. Pinned buffers came back only when the cache evicted an entry,
+    and it keeps up to 32, so until then every chat request pinned a fresh buffer: 72-83 ms of a
+    204 ms prefill on an RTX 5090 box. Pinning ahead on another thread does not hide it -- the
+    driver stalls the other thread's CUDA calls for the duration.
+  - **Now:** a snapshot is filled in a pinned buffer from a small free list, then a background
+    thread moves it to reused pageable memory (a plain memcpy) and hands the pinned buffer back.
+    After the first snapshot of a process nothing pins on the request path. A cache hit restores
+    from pageable memory (~19 ms instead of ~8 ms). `SPARKINFER_SNAPSHOT_MIGRATE=0` keeps
+    snapshots pinned.
+  - **Measured** (AIPerf chat 1024/256, RTX 5090, ModelOpt NVFP4): c16 583 -> 696 tok/s, TTFT
+    p50 2.78 -> 2.04 s; one request at a time, prefill p50 204 -> 134 ms.
+    `prefix_resume_check` under `SPARKINFER_DETERMINISTIC=1`: a hit still reproduces the uncached
+    split exactly.
+
 - **Sampled requests decode speculatively** with DSpark (1.5x at T=0.7 and T=1.0 on Qwen3.8-27B).
   - **Before:** only greedy requests speculated, and a request that sets no temperature takes
     generation_config's T=1.0, so almost no chat traffic did.

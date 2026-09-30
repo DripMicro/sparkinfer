@@ -139,6 +139,14 @@ struct Qwen35PrefillCtx {
     // run: the buffer is carved from the verify arena, whose layout is fixed across passes, so it
     // holds this pass's logits until the next verify pass.
     float**              packed_logits_out = nullptr;
+    // dflash_verify_short_run as a PREFILL of n known tokens (Qwen35Model::ingest_tail_rows):
+    // verify_eager runs it without the verify graph cache -- no flush, no replay, no recording --
+    // so a call for a session other than the cached one leaves packed decode's graphs alone;
+    // verify_commit_all commits every row, where a speculative verify keeps only the accepted
+    // prefix; verify_logits_out receives the address of the rows' logits ([n, vocab] fp32).
+    bool                 verify_eager = false;
+    bool                 verify_commit_all = false;
+    float**              verify_logits_out = nullptr;
     // The Bonsai decode shadow's layers (n_layers entries), or null. A packed step reads its FFN
     // and its attention q/k/v and output projections from their ternary legs through the
     // arithmetic single-row decode runs on them, so every row decodes bit-identically batched or
@@ -177,6 +185,13 @@ struct Qwen35PrefillCtx {
     // Optional: redraws prompt i's seed with its request's sampler. Called after prompt i's
     // argmax is read back, with its last-position logits still in `logits`; returns the token to
     // keep, or -1 to keep the argmax. Null keeps every argmax.
+    // Packed prompts' prefix-cache checkpoints, at most one per prompt. multi_ckpt_row[i] > 0 is
+    // the row inside prompt i after which every Gated-DeltaNet layer's scan state and conv window
+    // go to multi_ckpt_host[i] -- pinned host memory in ckpt_host's layout, with ckpt_state_bytes
+    // as for ckpt_host. That prompt's conv and scan run in two parts carrying the state across,
+    // on the pass's own stream. Null, or a row of 0, takes no checkpoint for that prompt.
+    const int*           multi_ckpt_row   = nullptr;
+    void* const*         multi_ckpt_host  = nullptr;
     int                (*multi_sample)(void* user, int i) = nullptr;
     void*                multi_sample_user = nullptr;
     // dflash_verify_short_run (not packed): when set, it replaces the verify rows' argmax with the
