@@ -283,7 +283,18 @@ int ContinuousBatchEngine::num_active() const {
     return n;
 }
 
-int ContinuousBatchEngine::num_free_kv_blocks() const { return kv_->num_free_blocks(); }
+// Free blocks plus those only the prefix cache holds: admission evicts the cache for those
+// (PrefixCache::evict_for), so for a caller sizing what it may send they are free. The refcounts
+// behind the second term change under the device mutex, so they are read only while holding it --
+// and only if it is free: /v1/capacity and /metrics must not wait out a long prefill. Otherwise the
+// last count stands.
+int ContinuousBatchEngine::num_free_kv_blocks() const {
+    if (prefix_cache_) {
+        std::unique_lock<std::recursive_mutex> lock(model_->device_mutex(), std::try_to_lock);
+        if (lock.owns_lock()) evictable_last_.store(prefix_cache_->evictable_blocks(), std::memory_order_relaxed);
+    }
+    return kv_->num_free_blocks() + (prefix_cache_ ? evictable_last_.load(std::memory_order_relaxed) : 0);
+}
 
 int ContinuousBatchEngine::num_waiting() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -633,6 +644,12 @@ void ContinuousBatchEngine::run_spec_group() {
             if (joiner) joiner->spec_tried = true;
         }
         if (!leave && joiner) {
+            // The join grows the session past its admission budget by a block or two (the verify's
+            // lookahead): make sure a pool the prefix cache has filled has them.
+            if (prefix_cache_) {
+                std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+                prefix_cache_->evict_for(4);
+            }
             int slot = 0;
             while (slot < G && slot_used[(size_t)slot]) ++slot;
             Qwen35Model::SpecHooks hooks;
@@ -923,6 +940,10 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
         hooks.snaps = snaps.data();
     }
     Qwen35Model::SpecResume r;
+    if (prefix_cache_) {   // its verify lookahead grows the session past the admission budget
+        std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+        prefix_cache_->evict_for(4);
+    }
     model_->dflash_generate(job.req.prompt, job.req.max_new_tokens, nullptr, nullptr, &hooks, &r);
     if (r.ckpts_taken) {
         for (size_t i = 0; i < ckpts.size(); ++i) {
@@ -1027,7 +1048,12 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
         std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
         if (job.req.use_prefix_session) {
             seq_id = 0;
-            if (!kv_->allocate(seq_id, budget)) return fail(EnqueueError::OVERLOADED);
+            // The prefix cache may be holding the room this turn needs: give it back first, as the
+            // automatic-cache branch below does.
+            if (!kv_->allocate(seq_id, budget) &&
+                !(prefix_cache_ && prefix_cache_->evict_for((budget + kv_->block_size() - 1) / kv_->block_size()) &&
+                  kv_->allocate(seq_id, budget)))
+                return fail(EnqueueError::OVERLOADED);
             model_->activate_session(seq_id);
             // The KV blocks survived the previous request, but its decoding advanced the hybrid
             // recurrent state past the prefix. Replay the end-of-prefix snapshot so the 48
