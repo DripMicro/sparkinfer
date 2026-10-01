@@ -1265,7 +1265,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->swa_vtbl); cudaFree(p_->swa_vlen); cudaFree(p_->emb_norm_ones);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     cudaFree(p_->dflash_hidden); cudaFree(p_->dflash_context);
-    // spec_lin_snap / spec_conv_snap are in owned[] (allocated via Impl::alloc)
+    cudaFree(p_->spec_lin_snap); cudaFree(p_->spec_conv_snap);
     for (auto& kv : p_->sessions) {
         if (kv.first == 0) continue;
         if (kv.second.lin_state) cudaFree(kv.second.lin_state);
@@ -3984,6 +3984,43 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // Give the NVFP4 LM-head operand back. It exists only to serve a packed decode wide enough to
 // want a GEMM, and it is the one piece of weight residency in this model that a run can decide it
 // does not need.
+// Bring an offloaded draft back, but only into room it leaves room beside: right after a busy
+// stretch, or another thread's out-of-memory offload, the device is still full, and a draft restored
+// there -- then pinned for a whole group -- leaves the group's prefills and every new session no
+// arena (AIPerf 8K prompts at c16 after a chat cell: 0.37x). The join's own room check covers what
+// a join needs; this keeps SPARKINFER_DRAFT_RESTORE_HEADROOM_MB beside the draft itself. False,
+// still offloaded, when there is no room. Callers hold the device mutex.
+template <class Impl>
+static bool restore_draft_with_room(Impl& s) {
+    if (!s.dflash_draft) return false;
+    if (!s.dflash_draft->offloaded()) return true;
+    static const size_t headroom = [] {
+        const char* e = getenv("SPARKINFER_DRAFT_RESTORE_HEADROOM_MB");
+        const long long mb = e ? atoll(e) : 1024LL;
+        return (size_t)(mb < 0 ? 0 : mb) << 20;
+    }();
+    size_t fb = 0, tb = 0;
+    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || fb < s.dflash_draft->footprint_bytes() + headroom)
+        return false;
+    return s.dflash_draft->restore();
+}
+
+// A loaded draft is the one large allocation that can step aside at no cost to a request in
+// flight: it is not reading anything unless a speculative prefill (capture on) or group is
+// running, and it comes back at the same addresses (DFlashDraftModel::offload). On a 32 GB card a
+// burst of 16 8K-token prompts beside it had no room for its prefill arena, and the pass fell to
+// the token loop -- 38 tok/s against 167 without the draft.
+template <class Impl>
+static bool offload_idle_draft(Impl& s, const char* what) {
+    if (!s.dflash_draft || s.dflash_capture || s.dflash_draft->offloaded()) return false;
+    cudaGetLastError();   // clear the failed allocation that brought us here
+    const size_t b = s.dflash_draft->offload();
+    if (!b) return false;
+    fprintf(stderr, "[spec] draft off the device: %s did not fit beside it (%.2f GB freed)\n",
+            what, (double)b / 1e9);
+    return true;
+}
+
 // Give the decode shadow's ternary copy back; decode then reads the folded weights, exactly as
 // with SPARKINFER_BONSAI_DECODE_SHADOW=0. The decode graphs have its pointers baked in, so they go
 // first and recapture on the next step. Returns whether anything was freed.
@@ -4220,6 +4257,12 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
         ctx.bonsai_pf_layers = nullptr;   // freed with the shadow: the retry reads the folded legs
         ctx.bonsai_pf_rs = nullptr;
         ctx.bonsai_dec_head = nullptr;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
+    // A loaded, idle draft before the head: the draft comes back when speculation resumes, and
+    // the head does not.
+    if (seed < 0 && scratch_oom && offload_idle_draft(s, "a prefill's arena")) {
+        scratch_oom = false;
         seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
     }
     // ...and the NVFP4 head, the other decode-only operand that can be given back.
@@ -4488,6 +4531,10 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
         bool oom = false;
         ctx.scratch_oom_out = &oom;
         int r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        if (r < 0 && oom && offload_idle_draft(s, "a packed prefill's arena")) {
+            oom = false;
+            r = prefill_batched_run(ctx, ids.data() + off[(size_t)b], rows, 0);
+        }
         // A pass whose arena did not fit ran nothing: give the NVFP4 head back and retry, as the
         // one-prompt pass does.
         if (r < 0 && oom && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
@@ -4659,7 +4706,9 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         // The decode shadow is a cache of weights decode can also read folded: a request that
         // cannot get its state takes the shadow's VRAM, once, rather than failing.
         if (attempt == 0 && release_bonsai_shadow(s)) continue;
-        if (attempt <= 1 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+        // An idle draft next: it comes back when speculation resumes; the head below does not.
+        if (attempt <= 1 && offload_idle_draft(s, "a session's state")) continue;
+        if (attempt <= 2 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
             fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a session's state\n");
             release_lm_head_fp4();
             continue;
@@ -5809,6 +5858,22 @@ int Qwen35Model::lm_head_quant_type() const { return p_->w.lm_head_type; }
 
 void Qwen35Model::set_dflash_draft(DFlashDraftModel* draft) { p_->dflash_draft = draft; }
 
+size_t Qwen35Model::dflash_draft_offload() {
+    if (!p_->dflash_draft) return 0;
+    std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    return p_->dflash_draft->offload();
+}
+
+bool Qwen35Model::dflash_draft_restore() {
+    if (!p_->dflash_draft) return false;
+    std::lock_guard<std::recursive_mutex> lock(device_mutex());
+    return restore_draft_with_room(*p_);
+}
+
+bool Qwen35Model::dflash_draft_offloaded() const {
+    return p_->dflash_draft && p_->dflash_draft->offloaded();
+}
+
 void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_layer_ids, int max_rows,
                                     int context_start, int context_end) {
     Impl& s = *p_;
@@ -5844,13 +5909,6 @@ void Qwen35Model::set_dflash_capture(bool on, const std::vector<int>& target_lay
         s.dflash_context = nullptr;
         fprintf(stderr, "[dflash] capture context (%d positions): out of device memory\n", s.dflash_ctx_cap);
     }
-    if (s.cfg.hybrid && !s.spec_lin_snap) {
-        const size_t ls = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads *
-                          s.cfg.linear_head_dim * s.cfg.linear_head_dim;
-        const size_t cs = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) * s.linear_qkvdim;
-        s.spec_lin_snap = s.alloc<float>(ls);
-        s.spec_conv_snap = s.alloc<bf16>(cs);
-    }
     if (const char* e = getenv("SPARKINFER_DFLASH_CAPTURE"); e && e[0] == '1')
         fprintf(stderr, "[dflash] capture on n_cap=%d max_rows=%d\n", s.dflash_n_cap, s.dflash_max_rows);
 }
@@ -5881,9 +5939,13 @@ int Qwen35Model::dflash_context_len() const { return p_->dflash_ctx_len; }
 void Qwen35Model::save_spec_snapshot() {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
-    if (!s.spec_lin_snap || !c.hybrid) return;
+    if (!c.hybrid) return;
     const size_t ls = (size_t)gdn_state_slots(c) * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim;
     const size_t cs = (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim;
+    // Allocated here, on first use, rather than with every capture: no serving path snapshots,
+    // and 155 MB held for nothing beside a loaded draft is part of what concurrent serving lacks.
+    if (!s.spec_lin_snap) s.spec_lin_snap = s.alloc<float>(ls);
+    if (!s.spec_conv_snap) s.spec_conv_snap = s.alloc<bf16>(cs);
     cu(cudaMemcpyAsync(s.spec_lin_snap, s.lin_state, ls * sizeof(float), cudaMemcpyDeviceToDevice, s.stream),
        "spec snap lin");
     cu(cudaMemcpyAsync(s.spec_conv_snap, s.lin_conv_state, cs * sizeof(bf16), cudaMemcpyDeviceToDevice, s.stream),
@@ -6075,6 +6137,11 @@ bool Qwen35Model::spec_group_begin() {
     Impl& s = *p_;
     if (!s.dflash_draft) return false;
     std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The worker restored the draft before deciding to speculate, but a session opened on another
+    // thread may have offloaded it again since (offload_idle_draft). Bring it back or decline, and
+    // pin it for the group: nothing may take it off the device while a member can read it.
+    if (!restore_draft_with_room(s)) return false;
+    s.dflash_draft->pin(true);
     bind_draft_shared_weights();
     s.dflash_draft->ensure_quant();
     return true;
@@ -6089,6 +6156,7 @@ void Qwen35Model::spec_group_end() {
     if (s.dflash_draft) {
         s.dflash_draft->use_slot(0);
         for (int i = 1; i < 8; ++i) s.dflash_draft->free_slot(i);
+        s.dflash_draft->pin(false);
     }
     // Capture-on graphs may not be replayed by the decode that takes over.
     invalidate_decode_graph();
@@ -6126,6 +6194,37 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join0).count();
     };
     double t_setup = 0, t_prefill = 0, t_seed = 0;
+    // Room for the whole join, checked before anything is touched -- so a decline here is like
+    // "draft slot" below, and the ordinary path prefills the request. Without it a long join
+    // started on a device that a busy stretch had filled got its slot and capture, then no arena
+    // for its pass, and a checkpointed or resumed prompt -- which cannot decline mid-way -- ran
+    // the token loop: ~80 s for 8K tokens with every other request waiting (AIPerf 8K prompts at
+    // c16, 0.37x). The pass's arena is ~128 KB a row (1,035 MB at 8,240) up to the 16K window;
+    // the capture, the slot and the verify arenas are sized as they are allocated below.
+    // SPARKINFER_SPEC_JOIN_ROOM=0 skips the check.
+    {
+        static const bool room_check = [] {
+            const char* e = getenv("SPARKINFER_SPEC_JOIN_ROOM");
+            return !(e && e[0] == '0');
+        }();
+        if (room_check) {
+            const size_t rows = (size_t)(n - prefill_from);
+            const size_t arena = ((size_t)64 << 20) + std::min<size_t>(rows, 16384) * ((size_t)128 << 10);
+            const int cap_from = std::max(prefill_from, n >= 12288 ? n - 4096 : 0);
+            const size_t cap_rows = (size_t)std::max(0, std::min(s.cfg.max_seq, n + max_new + depth + 1) - cap_from);
+            const size_t capture = cap_rows * dc.target_layer_ids.size() * (size_t)s.cfg.hidden * sizeof(bf16);
+            const size_t slot_bytes = (size_t)(n + max_new + 2 * (depth + 1)) *
+                (2 * (size_t)dc.n_layers * dc.n_kv_heads * dc.head_dim + dc.hidden) * sizeof(bf16);
+            const size_t verify = (size_t)320 << 20, margin = (size_t)256 << 20;
+            // The capture buffer this join replaces is freed before the new one is allocated.
+            const size_t reused = s.dflash_context
+                ? (size_t)s.dflash_ctx_cap * s.dflash_n_cap * s.cfg.hidden * sizeof(bf16) : 0;
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess &&
+                fb + reused < arena + capture + slot_bytes + verify + margin)
+                return fail("no room for the join");
+        }
+    }
     // The slot holds what this request can reach (the bound checked above), not the draft's whole
     // context: a group of four at 16K would otherwise borrow ~1.5 GB.
     if (!draft.use_slot(slot, n + max_new + 2 * (depth + 1))) return fail("draft slot");
@@ -6145,7 +6244,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
     if (trace) { cudaDeviceSynchronize(); t_setup = ms_at(); }
     // The same prefill dflash_generate runs (see there): batched from zero or resumed past it, the
     // token loop for what a pass leaves, and the caller's checkpoints one pass or per segment.
-    auto prefill_range = [&](int a, int b) -> int {
+    auto prefill_range = [&](int a, int b, bool may_decline = false) -> int {
         int r = -1, done = a;
         if (a == 0 && batched_prefill_windowed_enabled(s.gguf, s.cfg, b, s.kv)) {
             int d = 0;
@@ -6156,6 +6255,14 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             r = prefill_batched_resume(prompt.data(), a, b, false, &d);
             done = a + d;
         }
+        // The token loop below is ~10 ms a token: 83 s for an 8K prompt whose batched pass found
+        // no room (measured, joining a group beside four other 8K members). A join is optional:
+        // declined with nothing written, the request prefills on the ordinary path, as after the
+        // declines above. So for a whole prompt that the pass left untouched, past a few hundred
+        // tokens, decline rather than hold every member for a minute. Not for a segment of a
+        // checkpointed prompt (the next segment assumes this one ran) or a resumed one (its
+        // failure aborts the request).
+        if (r < 0 && may_decline && done == a && b - a > 256) return -1;
         if (r < 0)
             for (int i = done; i < b; i++) {
                 set_dflash_capture_row(0);
@@ -6186,7 +6293,7 @@ int Qwen35Model::spec_group_join(const std::vector<int>& prompt, int max_new, in
             next = prefill_range(pos, n);
         }
     } else {
-        next = prefill_range(prefill_from, n);
+        next = prefill_range(prefill_from, n, /*may_decline=*/prefill_from == 0);
     }
     if (trace) t_prefill = ms_at();
     if (next >= 0 && next < s.cfg.vocab && hooks.temperature > 0.f)
@@ -6519,6 +6626,18 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     if (resume) *resume = SpecResume{};
     if (!s.dflash_draft || prompt.empty() || max_new <= 0) return out;
     DFlashDraftModel& draft = *s.dflash_draft;
+    // On the device and pinned for the whole generation, as spec_group_begin does for a group:
+    // an empty result sends the request down the ordinary path.
+    {
+        std::lock_guard<std::recursive_mutex> dl(s.device_mu);
+        if (!restore_draft_with_room(s)) return out;
+        draft.pin(true);
+    }
+    struct Unpin {
+        DFlashDraftModel& d;
+        std::recursive_mutex& m;
+        ~Unpin() { std::lock_guard<std::recursive_mutex> l(m); d.pin(false); }
+    } unpin{draft, s.device_mu};
     const DFlashDraftConfig& dc = draft.config();
     // The most proposals a block carries: DFlash2 reads them from rows 1..block_size-1 (row 0 is
     // the anchor), DSpark's row-shifted mapping from all block_size rows.
