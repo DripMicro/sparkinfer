@@ -498,8 +498,8 @@ public:
         const int* top_k = nullptr;                    // [n]; <= 0 or >= vocab is off
         const float* top_p = nullptr;                  // [n]; >= 1 is off
     };
-    // Ingest the 1-8 tokens a prompt's aligned prefill leaves over in ONE forward of the verify
-    // path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
+    // Ingest up to 32 tokens -- the 1-7 an aligned prefill leaves over, or a short resumed range --
+    // in ONE forward of the verify path (see qwen35.cpp). Returns the last row's argmax with its logits left in place, or -1 if
     // the path declined, in which case nothing was committed.
     int ingest_tail_rows(const int* token_ids, int n, int pos0);
     // Prefill several FRESH sessions' prompts in ONE batched pass (Qwen35PrefillCtx::multi_n):
@@ -655,6 +655,17 @@ public:
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
                        int* out_sampled, const PackedSampling* sampling = nullptr);
+    // MIXED STEP: ONE forward that decodes n_dec packed rows (what decode_packed does for them) and
+    // prefills the next `len` tokens of chunk_seq's prompt at positions pos0.. (what a prefill
+    // pass or resume does for them), every row-wise weight read shared (Qwen35PrefillCtx::mix_n).
+    // out_sampled gets the decode rows' tokens, sampled as decode_packed samples them;
+    // *chunk_seed the argmax at the chunk's last position (the prompt's first token when this is
+    // its last chunk). Returns false having run nothing when the model or batch cannot take it
+    // (Qwen3.8 dense hybrid, int8 KV, no vision/MRoPE/DSpark capture, a chunk session with fp32
+    // state and no logit bias); the caller then runs the decode step and the prefill apart.
+    bool mixed_step(const int* tokens, const int* positions, const uint64_t* seq_ids, int n_dec,
+                    int* out_sampled, const PackedSampling* sampling, uint64_t chunk_seq,
+                    const int* chunk_ids, int pos0, int len, int* chunk_seed);
     // Largest n decode_packed() accepts. Matches the packed graph tiers.
     static int max_packed_rows();
     uint64_t active_session() const;
