@@ -70,7 +70,13 @@ inline void pf_cu(cudaError_t e, const char* what) {
 // string's address rather than the formatted text on purpose: several of these carry a position
 // or layer index that moves every step, so deduplicating on the text would suppress nothing and
 // grow without bound.
-__attribute__((format(printf, 1, 2))) void verify_decline(const char* fmt, ...) {
+// MSVC has no format attribute; gcc and clang still check every call's arguments.
+#if defined(__GNUC__) || defined(__clang__)
+#define SI_VERIFY_DECLINE_FMT __attribute__((format(printf, 1, 2)))
+#else
+#define SI_VERIFY_DECLINE_FMT
+#endif
+SI_VERIFY_DECLINE_FMT void verify_decline(const char* fmt, ...) {
     static std::mutex mu;
     static std::vector<const char*> seen;
     {
@@ -2629,7 +2635,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // workspace slot; the launches, and so every row of every prompt, are unchanged.
                 // SPARKINFER_PACK_GDN_STREAMS=1 keeps them on one stream (A/B in one binary).
                 constexpr int kSegStreams = 3;
-                static const int seg_streams = [] {
+                static const int seg_streams = [&] {
                     const char* e = getenv("SPARKINFER_PACK_GDN_STREAMS");
                     const int v = e ? atoi(e) : kSegStreams;
                     return v < 1 ? 1 : v > kSegStreams ? kSegStreams : v;
