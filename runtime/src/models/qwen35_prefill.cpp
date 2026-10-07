@@ -5448,13 +5448,24 @@ static bool muse_packed_on() {
 // step is still on the dp4a path -- every tensor-core arm has an eight-row floor, because an
 // m16n8k32 tile pads M to sixteen. This is the one place a narrow batch can reach the tensor cores,
 // and the fitted six was keeping it off them.
-static int gu_gemm_min_rows() {
-    static const int v = [] {
+//
+// That -7.4% at two rows was measured against two separate gate and up GEMMs, each after its own
+// quantize. Gate and up are now one GEMM over the interleaved operand, whose FP4 A operand the
+// sandwich tail writes (#1345), launched as a programmatic dependent that prefetches its first
+// weight tiles while the tail runs (#1348), and the down projection follows it in FP4. At two and
+// three rows that route now beats the dp4a GEMVs it replaced, measured end to end:
+//
+//     c=2   min_rows 4 -> 166.2 tok/s (12.09 ms/step)   min_rows 2 -> 189.7 (10.6 ms)   +14.1%
+//     c=3   min_rows 4 -> 208.1                          min_rows 2 -> 275.7             +32.5%
+//
+// so a packed decode step takes it from two rows. A one-row step is left on the GEMV, and a grouped
+// verify keeps the four-row floor it was tuned with. SPARKINFER_GU_GEMM_MIN_ROWS sets both.
+static int gu_gemm_min_rows(bool packed) {
+    static const int env = [] {
         const char* e = getenv("SPARKINFER_GU_GEMM_MIN_ROWS");
-        const int x = e ? atoi(e) : 4;
-        return x < 1 ? 1 : x;
+        return e ? std::max(1, atoi(e)) : 0;
     }();
-    return v;
+    return env ? env : (packed ? 2 : 4);
 }
 
 // Gate and up for `rows` packed rows through the prefill NVFP4 operands the model already holds,
@@ -6957,7 +6968,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             bool hn_q8_ready = false;
             // The interleaved gate/up GEMM below reads hn as an FP4 operand: let the tail write it.
             const bool hn_fp4_pk = packed_tail && muse_tail_fp4_on() && w.gu_interleaved &&
-                wide && topk == 1 && N >= gu_gemm_min_rows() && fp4_a && fp4_asf &&
+                wide && topk == 1 && N >= gu_gemm_min_rows(packed) && fp4_a && fp4_asf &&
                 packed_gu_buf && w.gate_fp4_alpha == w.up_fp4_alpha &&
                 kernels::prefill_nvfp4_supported(Ng, 2 * ffn, H) &&
                 kernels::launch_muse_tail_fp4_exact(x, ao, w.post_attn_norm, w.ffn_norm, h, hn,
@@ -6981,7 +6992,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // Wide enough to be worth a block-scaled GEMM: run gate/up through the FP4 operands
             // this model already holds for prefill and hand the pair to the call below, which then
             // does only the SwiGLU and the GGUF down GEMV.
-            const bool gu_want = wide && topk == 1 && N >= gu_gemm_min_rows();
+            const bool gu_want = wide && topk == 1 && N >= gu_gemm_min_rows(packed);
             // ...and down through its FP4 copy when it is resident, or a streamed Q6_K convert
             // into the persistent operand when it is not -- the Q4_K MMA was a quarter of the step.
             const void* dn4 = w.down_fp4;
