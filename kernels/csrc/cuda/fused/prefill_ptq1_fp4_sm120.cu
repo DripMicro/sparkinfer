@@ -57,6 +57,9 @@ ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* _
                      const signed char* __restrict__ sign, unsigned char* __restrict__ q,
                      int rows, int k) {
     __shared__ float sh[kSpan];
+    // The GEMM reading `q` launches programmatic and waits for this grid before it touches q:
+    // let its CTAs start their weight decode now.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int t = threadIdx.x, lane = t & 31;
     const int row = blockIdx.x;
     unsigned char* qrow = q + (size_t)row * (k / 2);
@@ -260,6 +263,9 @@ __device__ __forceinline__ void mb_arrive(unsigned a) {
 __device__ __forceinline__ void mb_cp_arrive(unsigned a) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" :: "r"(a) : "memory");
 }
+// Programmatic dependent launch: everything before this reads only shared memory and the weights
+// (model constants); A, C and the partials are touched only after it.
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void mb_wait(unsigned a, unsigned parity) {
     asm volatile("{ .reg .pred p; W%=: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1; @!p bra W%=; }"
                  :: "r"(a), "r"(parity) : "memory");
@@ -405,6 +411,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         const int lane = tid - (N_MMA + N_DEC);
         const size_t arow = (size_t)K / 2, asrow = (size_t)K / 16;
         const unsigned char* asf_g = a + (size_t)M * arow;
+        pdl_wait();
         int g = 0;
         for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
             int mt, leg, n0, kb0, nst;
@@ -457,6 +464,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             }
             mb_cp_arrive(fullA(s));
         };
+        // The first pair of stages is decoded before the wait (it reads only weights), and its A
+        // loads issued after it; from then on each pair's A loads go first.
+        bool waited = !FOLD;
         int g = 0;
         for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
             int mt, leg, n0, kb0, nst;
@@ -484,12 +494,18 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                 const int s0 = g % NS, s1 = (g + 1) % NS;
                 if (g >= NS) mb_wait(emptyB(s0), ((g / NS) - 1) & 1);
                 if (two && g + 1 >= NS) mb_wait(emptyB(s1), (((g + 1) / NS) - 1) & 1);
-                if constexpr (FOLD) {
+                if (FOLD && waited) {
                     load_a(s0, kb0 + i, m0);
                     if (two) load_a(s1, kb0 + i + 1, m0);
                 }
                 decode_half(tw[0], h, br, sm.lut, sm.b[s0], &sm.bsf[s0][br]);
                 if (two) decode_half(tw[1], h, br, sm.lut, sm.b[s1], &sm.bsf[s1][br]);
+                if (FOLD && !waited) {
+                    pdl_wait();
+                    waited = true;
+                    load_a(s0, kb0 + i, m0);
+                    if (two) load_a(s1, kb0 + i + 1, m0);
+                }
                 mb_arrive(fullB(s0));
                 if (two) mb_arrive(fullB(s1));
                 g += two ? 2 : 1;
@@ -503,6 +519,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     // ---------------- MMA warps ----------------
     const int warp = tid >> 5, lane = tid & 31;
     const int wm = warp & 1, wn = warp >> 1;
+    pdl_wait();   // the epilogue reads (RESID) and writes C
     int g = 0;
     for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
         int mt, leg, n0, kb0, nst;
@@ -671,9 +688,28 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     const auto* A = static_cast<const unsigned char*>(a);
     float* P = splits > 1 ? part : nullptr;
     const bool rk = resid && !P;
+    // Launched programmatic: its CTAs build the table and decode their first weight stages while
+    // the kernel ahead (the rotation writing A) finishes. SPARKINFER_PTQ1_FP4_PDL=0 launches it
+    // normally (A/B in one binary).
+    static const bool pdl = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_PDL");
+        return !(e && e[0] == '0');
+    }();
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
 #define PTQ1_FP4_GO(R_, F_)                                                                   \
-    ptq1_fp4_gemm_kernel<R_, F_><<<grid, Ring<F_>::THREADS, F_ ? smem_f : smem_s, st>>>(      \
-        A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha)
+    do {                                                                                      \
+        cudaLaunchConfig_t cfg = {};                                                          \
+        cfg.gridDim = dim3(grid);                                                             \
+        cfg.blockDim = dim3(Ring<F_>::THREADS);                                               \
+        cfg.dynamicSmemBytes = F_ ? smem_f : smem_s;                                          \
+        cfg.stream = st;                                                                      \
+        cfg.attrs = &la;                                                                      \
+        cfg.numAttrs = pdl ? 1 : 0;                                                           \
+        cudaLaunchKernelEx(&cfg, ptq1_fp4_gemm_kernel<R_, F_>, A, m, k, L, P, per, mtiles,    \
+                           tiles_n, nitems, alpha);                                           \
+    } while (0)
     if (fold) { if (rk) PTQ1_FP4_GO(true, true);  else PTQ1_FP4_GO(false, true);  }
     else      { if (rk) PTQ1_FP4_GO(true, false); else PTQ1_FP4_GO(false, false); }
 #undef PTQ1_FP4_GO
