@@ -1393,6 +1393,33 @@ bool prefer_transposed(int m, int n) {
 // dependent of the kernel ahead of it (CUTLASS's mainloop and epilogue producers wait on it before
 // their first global read), so its CTAs are resident and past their prologue when that kernel ends.
 bool g_gemm_pdl = false;
+// Set by launch_prefill_nvfp4_gemm_fill for the launch it wraps: from BigM's row floor up, the tile
+// is chosen by how full its last wave is (wide_fills_better) rather than BigM unconditionally.
+bool g_gemm_fill = false;
+
+// BigM (256x128x128) halves the CTA count of the 128x128 tile, which pays once either grid covers
+// the machine several times (BigM is ahead at every Ternary-Bonsai-2 shape from 1024 rows up). At
+// a few hundred rows the narrow legs leave BigM's grid short of one wave: at 512 rows the n = 5120
+// legs (down, ssm_out, o) are 80 CTAs on 170 SMs and k/v (n = 1024) are 16. The 128x128 tile is
+// taken where its last wave is fuller by more than 6% of the machine. Measured on an RTX 5090
+// at m = 512, Ternary-Bonsai-2's kept NVFP4 legs, us, BigM -> 128x128 (CTAs):
+//   n=5120 (down, ssm_out, o)  73.9 -> 51.2 (80 -> 160)   k, v n=1024  34.0 -> 20.0 (16 -> 32)
+//   q n=12288                  72.0 -> 65.9 (192 -> 384)  -- each picked by the rule
+//   z n=6144                   37.8 -> 43.9 (96 -> 192)   gdn qkv n=10240 37.6 -> 47.5 (160 -> 320)
+//                                                         -- each kept on BigM by it
+// SPARKINFER_NVFP4_FILL_TILE=0 keeps BigM there (A/B in one binary).
+bool wide_fills_better(int m, int n) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_FILL_TILE");
+        return !(e && e[0] == '0');
+    }();
+    const int sms = sm_count();
+    if (!on || sms <= 0) return false;
+    auto fill = [&](long g) { return (double)g / ((double)((g + sms - 1) / sms) * sms); };
+    const long nt = (n + 127) / 128;
+    const long big = (long)((m + 255) / 256) * nt, wide = (long)((m + 127) / 128) * nt;
+    return fill(wide) > fill(big) + 0.06;
+}
 
 template <class C>
 bool run_gemm(const void* a, const void* sa, const void* b, const void* sb,
@@ -2410,7 +2437,7 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
     // grid so the scored ctx=128 shape is untouched, and it falls through if CUTLASS cannot
     // implement the shape.
     const int big = nvfp4_big_tile();
-    if (big && m >= 512) {
+    if (big && m >= 512 && !(g_gemm_fill && wide_fills_better(m, n))) {
         if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
 
     }
@@ -2493,6 +2520,14 @@ bool launch_prefill_nvfp4_gemm_swiglu_quant(const void* a, const void* sa, const
     if (nvfp4_big_tile() && m >= 512 &&
         run_swiglu_gemm<SwiBigM>(a,sa,b,sb,gate_bf16,dst_fp4,dst_sf,m,n,k,st,alpha)) return true;
     return run_swiglu_gemm<SwiWide>(a,sa,b,sb,gate_bf16,dst_fp4,dst_sf,m,n,k,st,alpha);
+}
+bool launch_prefill_nvfp4_gemm_fill(const void* a, const void* sa, const void* b, const void* sb,
+                                    void* d, int m, int n, int k, void* ws, cudaStream_t st,
+                                    float alpha, const void* c) {
+    g_gemm_fill = true;
+    const bool ok = launch_prefill_nvfp4_gemm(a, sa, b, sb, d, m, n, k, ws, st, alpha, c);
+    g_gemm_fill = false;
+    return ok;
 }
 bool launch_prefill_nvfp4_gemm_pdl(const void* a, const void* sa, const void* b, const void* sb,
                                    void* d, int m, int n, int k, void* ws, cudaStream_t st,

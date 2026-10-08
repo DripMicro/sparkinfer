@@ -2571,8 +2571,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const float alpha = kernels::ptq1_nvfp4_alpha();
         fp4_leg(W, n_out, K, &wd, &wl);
         const size_t a_main = fp4_parts(A_i8, N8, K, &ad, &ar, &al, false);
-        kernels::launch_prefill_nvfp4_gemm(ad, al, wd, wl, C, N8, n_out, K, nullptr, st, alpha,
-                                           resid ? C : nullptr);
+        kernels::launch_prefill_nvfp4_gemm_fill(ad, al, wd, wl, C, N8, n_out, K, nullptr, st,
+                                                alpha, resid ? C : nullptr);
         if (N8 < N) {
             const int tail = N - N8;
             bf16* T = reinterpret_cast<bf16*>(wbuf);
@@ -4446,10 +4446,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             ffg, nullptr, static_cast<const signed char*>(s.bonsai_sign_ffn), ad,
                             nullptr, m8, ffn, s.bonsai_block, st, as);
                     } else {
-                        kernels::launch_prefill_nvfp4_gemm(ad, as, tg_d, tg_s, ffg, m8, ffn, H,
-                                                           nullptr, st, alpha);
-                        kernels::launch_prefill_nvfp4_gemm(ad, as, tu_d, tu_s, ffu, m8, ffn, H,
-                                                           nullptr, st, alpha);
+                        kernels::launch_prefill_nvfp4_gemm_fill(ad, as, tg_d, tg_s, ffg, m8, ffn,
+                                                                H, nullptr, st, alpha);
+                        kernels::launch_prefill_nvfp4_gemm_fill(ad, as, tu_d, tu_s, ffu, m8, ffn,
+                                                                H, nullptr, st, alpha);
                         fp4_parts(A_i8, m8, ffn, &ad, &ar, &as, false);
                         kernels::launch_ptq1_rotq_rows_nvfp4(
                             ffg, ffu, static_cast<const signed char*>(s.bonsai_sign_ffn), ad,
@@ -4457,15 +4457,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     }
                     if (m8 == fn) {
                         if (ffn_fused)
-                            kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s, xc, fn, H, ffn,
-                                                               nullptr, st, alpha, xc);
+                            kernels::launch_prefill_nvfp4_gemm_fill(ad, as, td_d, td_s, xc, fn, H,
+                                                                    ffn, nullptr, st, alpha, xc);
                         else
-                            kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s,
-                                                               ao + (size_t)fo * H, fn, H, ffn,
-                                                               nullptr, st, alpha);
+                            kernels::launch_prefill_nvfp4_gemm_fill(ad, as, td_d, td_s,
+                                                                    ao + (size_t)fo * H, fn, H,
+                                                                    ffn, nullptr, st, alpha);
                     } else {
-                        kernels::launch_prefill_nvfp4_gemm(ad, as, td_d, td_s, ffu, m8, H, ffn,
-                                                           nullptr, st, alpha);
+                        kernels::launch_prefill_nvfp4_gemm_fill(ad, as, td_d, td_s, ffu, m8, H,
+                                                                ffn, nullptr, st, alpha);
                         if (ffn_fused)
                             kernels::launch_prefill_add(xc, ffu, xc, (long)fn * H, st);
                         else

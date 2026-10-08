@@ -143,6 +143,13 @@ bool launch_prefill_nvfp4_gemm(const void* a_fp4, const void* sfa,
                                void* d_bf16, int m, int n, int k,
                                void* workspace, cudaStream_t stream = nullptr,
                                float alpha = 1.f, const void* c_bf16 = nullptr);
+// The same GEMM with its tile chosen by how full the grid's last wave is from 512 rows up (the
+// 128x128 tile where BigM's grid falls well short of one), for Ternary-Bonsai-2's ternary legs.
+bool launch_prefill_nvfp4_gemm_fill(const void* a_fp4, const void* sfa,
+                                    const void* b_fp4, const void* sfb,
+                                    void* d_bf16, int m, int n, int k,
+                                    void* workspace, cudaStream_t stream = nullptr,
+                                    float alpha = 1.f, const void* c_bf16 = nullptr);
 // The same GEMM launched as a programmatic dependent of the kernel ahead of it on `stream` (PDL):
 // it waits for that kernel before its first global read, so only its launch and prologue overlap.
 bool launch_prefill_nvfp4_gemm_pdl(const void* a_fp4, const void* sfa,
